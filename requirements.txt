@@ -1,0 +1,10 @@
+arxiv
+requests
+pymupdf
+openai
+zulip
+pyyaml
+sentence-transformers
+# 참고: GPU를 요약 모델에 양보하기 위해 torch는 CPU 휠 권장 —
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+# 를 먼저 실행한 뒤 이 파일을 설치할 것 (README 참조).

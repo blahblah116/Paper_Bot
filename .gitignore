@@ -1,0 +1,18 @@
+# 실제 운영 설정 — 이메일·채널명 등 개인 정보 포함 (config.example.yaml만 커밋)
+config.yaml
+
+# Zulip 봇 인증 파일 — 절대 커밋 금지
+zuliprc
+
+# 로컬 데이터
+data/papers.db
+data/pdfs/
+data/.lock
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/

@@ -1,0 +1,86 @@
+# paperbot 설정 예시 — 이 파일을 config.yaml로 복사한 뒤 값을 채우세요:
+#   cp config.example.yaml config.yaml
+# 실제 config.yaml은 .gitignore 처리되어 커밋되지 않습니다.
+
+topics:
+  # 주제·학회·연도·인용 수 필터는 전부 여기서 조절한다 (코드 수정 없이).
+  - name: "graph-transformer"
+    channel: "#papers-gt"           # 이 topic의 결과가 갈 Slack 채널 (생략 시 slack.channel 기본값)
+    # 자연어 관심사 서술 — relevance 필터(임베딩·LLM judge)의 기준이 된다.
+    # 임베딩 모델(all-MiniLM-L6-v2)이 영어 중심이라 영어(또는 영어 용어 혼합)로 쓰는 것이 정확하다.
+    interest: >
+      Graph Transformer and Graph Mamba family architectures: positional and
+      structural encodings, graph generalization of attention, long-range
+      dependencies, and scalability. Exclude plain GNN application papers.
+    sources:
+      semantic_scholar:
+        query: '"graph transformer" | "graph mamba"'
+        venues: ["ICLR", "NeurIPS", "ICML", "KDD"]   # 빈 리스트면 venue 필터 없음
+        year: "2020-"                # S2 문법: "2024", "2024-2026", "2024-"
+        min_citations: 5             # 인용 수 하한 — "저명한 논문" 필터
+        # sort: "recency"(기본, 최신순) | "citations"(인용순 — --backfill 명작 시딩용)
+      arxiv:
+        enabled: true                # 프리프린트도 받을지
+        query: 'cat:cs.LG AND (abs:"graph transformer" OR abs:"graph mamba")'
+
+  - name: "cad-reverse-engineering"
+    channel: "#papers-cad"
+    interest: >
+      B-rep based CAD reverse engineering, CAD reconstruction/generation,
+      representation learning for solid models.
+    sources:
+      semantic_scholar:
+        query: '"B-rep" | "CAD reconstruction" | "CAD generation"'
+        venues: ["CVPR", "ICCV", "ECCV", "SIGGRAPH"]
+        year: "2024-"
+        min_citations: 0             # 니치 분야는 0 권장 (relevance 필터가 품질을 거름)
+      arxiv:
+        enabled: true
+        query: '(cat:cs.CV OR cat:cs.GR) AND (abs:"B-rep" OR abs:"CAD reconstruction")'
+
+fetch:
+  max_results_per_query: 10   # 소스별 검색 후보 수 (S2 bulk는 1페이지=1000건이라 비용 동일)
+  arxiv_lookback_days: 14     # arXiv 신선도 창 — 최근 N일 제출분만
+  s2_lookback_days: 0         # 0 = lookback 비활성, 시간 범위를 topic별 year에 위임 (권장).
+                              # 논문이 min_citations 문턱을 넘는 순간 신규로 잡힘.
+  unpaywall_email: ""         # PDF 403 시 Unpaywall로 합법 OA 사본 조회 (본인 이메일, 비우면 미사용)
+
+quota:
+  # 실행(=하루)당 채널(topic)별 발행 상한 — 필터 통과분 중 소스별 최신순. 0 = 무제한.
+  s2_per_topic: 3
+  arxiv_per_topic: 2
+
+filter:
+  embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
+  embedding_device: "cpu"     # GPU는 요약 모델 전용으로 남겨둔다
+  embedding_threshold: 0.25   # interest와 abstract의 cosine 하한 (미만이면 컷)
+  llm_judge: true             # 임베딩 통과분을 LLM으로 재채점할지
+  judge_threshold: 6          # 0~10 점수 하한
+
+llm:
+  base_url: "http://localhost:11434/v1"
+  model: "qwen3.5:27b"        # V100 16GB×2 분산 기준. 1장이면 "qwen3.5:9b"
+  num_ctx: 65536              # 서버 OLLAMA_CONTEXT_LENGTH와 일치시킬 것 (README 참조)
+  max_input_chars: 150000     # 논문 전문 절단 없이 (num_ctx 예산 내)
+  max_output_tokens: 8192     # 요약 출력 상한 (thinking 포함) — 폭주 방지
+  temperature: 0.3
+  language: "ko"              # 요약 출력 언어
+
+publisher:
+  backend: "slack"            # "zulip" | "slack"
+  dry_run: false              # true면 전송 대신 stdout 출력 (토큰 없이 테스트 가능)
+
+slack:
+  channel: "#papers"          # 기본 채널 — topic에 channel이 없을 때 사용 (봇 초대 필수)
+  attach_figure: true         # 대표 figure를 스레드에 첨부 — 앱에 files:write 스코프 필요
+  max_figures: 3              # 논문당 첨부 figure 수 (앞 8페이지에서 큰 순으로 선별)
+  # 봇 토큰은 환경변수 SLACK_BOT_TOKEN으로 주입 (config에 넣지 않는다)
+
+zulip:                        # backend를 "zulip"으로 바꾸면 사용
+  config_file: "./zuliprc"
+  stream: "papers"
+
+storage:
+  db_path: "./data/papers.db" # 처리 이력 sqlite (절대 경로 권장, 파일 경로여야 함)
+  pdf_dir: "./data/pdfs"
+  keep_pdfs: false            # 요약 후 PDF 삭제 여부
