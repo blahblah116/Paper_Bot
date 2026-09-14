@@ -46,9 +46,12 @@ fetch:
   unpaywall_email: ""         # PDF 403 시 Unpaywall로 합법 OA 사본 조회 (본인 이메일, 비우면 미사용)
 
 quota:
-  # 실행(=하루)당 채널(topic)별 발행 상한 — 필터 통과분 중 소스별 최신순. 0 = 무제한.
+  # 실행(=하루)당 채널(topic)별 발행 상한. 0 = 무제한.
+  # 필터 통과분 중 초과분은 DB에 pending으로 적재 → 다음 실행에서 소스별 오래된 순(FIFO)으로
+  # 먼저 쿼터를 채우고, 남은 자리를 신규 최신 논문이 채움.
   s2_per_topic: 3
   arxiv_per_topic: 2
+  pending_max_age_days: 30    # 이보다 오래 대기한 pending은 폐기(expired). 0 = 무제한
 
 filter:
   embedding_model: "sentence-transformers/all-MiniLM-L6-v2"

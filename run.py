@@ -139,8 +139,10 @@ def fetch_all(cfg: Config, backfill: bool) -> list[Paper]:
 def apply_quota(papers: list[Paper], quota) -> list[Paper]:
     """topic(채널)×소스별 발행 상한 적용. 0이면 해당 소스 무제한.
 
-    papers는 fetch 순서(소스별 최신순)를 유지하므로 상한 내에서 최신 논문이 선택된다.
-    초과분은 DB에 기록되지 않아 다음 실행 때 자연스럽게 이월(carry-over)된다.
+    입력 순서를 유지한 채 (topic, source)별 앞에서부터 상한만큼 고른다.
+    호출자는 [pending 대기열(오래된 순)] + [신규 필터 통과분(최신순)] 순서로 넘기므로
+    대기열이 먼저(FIFO) 소진되고, 남은 자리를 신규 최신 논문이 채운다.
+    선택되지 않은 신규분은 호출자가 store.mark_pending()으로 대기열에 넣는다.
     """
     if quota.s2_per_topic <= 0 and quota.arxiv_per_topic <= 0:
         return papers
@@ -220,16 +222,31 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
         n_passed = len(passed)
         logger.info("필터 통과 %d편 (미처리 %d편 중)", n_passed, len(todo))
 
-        # topic(채널)×소스별 일일 발행 쿼터 — 초과분은 다음 실행으로 이월.
-        before_quota = len(passed)
-        passed = apply_quota(passed, cfg.quota)
-        if len(passed) < before_quota:
-            logger.info("발행 쿼터 적용: %d편 → %d편 (초과 %d편은 다음 실행으로 이월)",
-                        before_quota, len(passed), before_quota - len(passed))
+        # pending 대기열: 이전 실행에서 필터는 통과했지만 쿼터에 밀린 논문 (topic×source별 FIFO).
+        expired = store.expire_pending(cfg.quota.pending_max_age_days)
+        if expired:
+            logger.info("pending 만료 폐기: %d편 (%d일 초과)", expired, cfg.quota.pending_max_age_days)
+        pending = store.load_all_pending(list(topics_by_name))
+        if pending:
+            logger.info("pending 대기열 %d편 로드 (오래된 순 우선)", len(pending))
 
+        # topic(채널)×소스별 일일 발행 쿼터 — 대기열 먼저, 남은 자리는 신규 최신순.
+        # 선택되지 않은 신규분은 pending으로 적재해 다음 실행에서 우선 처리한다.
+        candidates = pending + passed
+        selected = apply_quota(candidates, cfg.quota)
         if args.limit is not None:
-            passed = passed[: args.limit]
-            logger.info("--limit 적용: %d편만 처리", len(passed))
+            selected = selected[: args.limit]
+            logger.info("--limit 적용: %d편만 처리", len(selected))
+        selected_uids = {p.uid for p in selected}
+        newly_pending = [p for p in passed if p.uid not in selected_uids]
+        for p in newly_pending:
+            store.mark_pending(p)
+        if pending or newly_pending or len(selected) < len(candidates):
+            counts = store.count_pending()
+            logger.info("발행 쿼터 적용: 대기열 %d + 신규 %d → %d편 선택, 신규 %d편 pending 적재 (대기열 총 %d편%s)",
+                        len(pending), len(passed), len(selected), len(newly_pending), sum(counts.values()),
+                        "".join(f", {t}/{s.replace('semantic_scholar', 's2')}={n}" for (t, s), n in sorted(counts.items())))
+        passed = selected
 
         done = failed = 0
         config_error: PublishConfigError | None = None

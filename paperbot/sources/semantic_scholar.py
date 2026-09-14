@@ -32,7 +32,8 @@ _FIELDS = ",".join([
     "title", "abstract", "venue", "year", "externalIds",
     "openAccessPdf", "citationCount", "authors", "publicationDate", "url",
 ])
-_MAX_RETRIES = 3
+_MAX_RETRIES = 4
+_RATE_LIMIT_WAITS = (3.0, 5.0, 10.0)   # 429 재시도 대기(초). 실측: S2 429는 수 초~15초 안에 풀림 — 2s/4s는 짧았음
 _MIN_INTERVAL_KEYED = 1.2     # 키 있음: S2 권장(1 rps)에 여유를 둔 간격
 _MIN_INTERVAL_KEYLESS = 8.0   # 키 없음: 공용 풀이라 훨씬 보수적으로
 _RETRY_AFTER_CAP = 120.0      # 비정상적으로 큰 Retry-After 방어
@@ -122,7 +123,7 @@ class SemanticScholarSource(PaperSource):
             except _RateLimited as e:
                 last_err = e
                 # Retry-After가 있으면 따르고, 없으면 최소 2초 + 지수 백오프.
-                wait = e.retry_after if e.retry_after is not None else max(2.0, float(2 ** attempt))
+                wait = e.retry_after if e.retry_after is not None else _RATE_LIMIT_WAITS[min(attempt, len(_RATE_LIMIT_WAITS)) - 1]
             except Exception as e:  # noqa: BLE001 — 5xx/연결 오류
                 last_err = e
                 wait = (2 ** attempt) * (1 if self.api_key else 3)  # 무키면 더 길게

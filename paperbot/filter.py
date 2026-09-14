@@ -29,6 +29,23 @@ logger = logging.getLogger(__name__)
 
 _JSON_RE = re.compile(r"\{.*?\}", re.DOTALL)
 
+# judge 출력 스키마 — 서버(Ollama)가 이 형식을 강제하므로 파싱 실패가 구조적으로 사라진다.
+_JUDGE_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "relevance_judge",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "score": {"type": "integer", "minimum": 0, "maximum": 10},
+                "reason": {"type": "string"},
+            },
+            "required": ["score", "reason"],
+            "additionalProperties": False,
+        },
+    },
+}
+
 
 def _parse_judge_json(text: str) -> tuple[float, str] | None:
     """LLM 출력에서 {"score": n, "reason": "..."} 파싱. 실패 시 None."""
@@ -89,7 +106,8 @@ class RelevanceFilter:
             try:
                 out = chat(
                     self.judge_client, self.cfg, messages,
-                    temperature=0.0, max_tokens=2560,  # thinking + 짧은 JSON이면 충분
+                    temperature=0.0, max_tokens=2560,  # thinking 꺼짐 + 스키마 강제 → 실제론 수십 토큰
+                    response_format=_JUDGE_RESPONSE_FORMAT,
                     label=f"judge({paper.uid})",
                 )
             except LLMError:

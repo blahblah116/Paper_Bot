@@ -3,17 +3,22 @@
 status 값:
   done              요약·포스팅 완료 → 재처리 안 함
   filtered_out      relevance 필터 탈락 → 재채점하지 않도록 기록
+  pending           필터는 통과했지만 발행 쿼터에 밀림 → 대기열(FIFO). payload에 Paper 전체 보존.
+  expired           pending이 pending_max_age_days를 넘겨 폐기됨
   failed            1회 실패 → 다음 실행 때 재시도 대상
   failed_permanent  재시도도 실패 → 영구 skip
 
 should_process()는 (미등록) 또는 (status == 'failed')일 때만 True.
+pending은 검색 결과에 다시 나타나도 재채점하지 않고, 대기열 경로(load_pending)로만 처리된다.
 """
 from __future__ import annotations
 
+import dataclasses
+import json
 import logging
 import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from .models import Paper
 
@@ -28,7 +33,8 @@ CREATE TABLE IF NOT EXISTS papers (
     status       TEXT,
     judge_score  REAL,
     processed_at TEXT,
-    error        TEXT
+    error        TEXT,
+    payload      TEXT
 );
 """
 
@@ -43,7 +49,15 @@ class Store:
         self.conn = sqlite3.connect(db_path)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute(_SCHEMA)
+        self._migrate()
         self.conn.commit()
+
+    def _migrate(self) -> None:
+        """기존 DB(payload 컬럼 없음)에 컬럼 추가 — 데이터 손실 없는 additive 마이그레이션."""
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(papers)")}
+        if "payload" not in cols:
+            self.conn.execute("ALTER TABLE papers ADD COLUMN payload TEXT")
+            logger.info("DB 마이그레이션: papers.payload 컬럼 추가 (pending 대기열용)")
 
     # --- 조회 ---
     def _status(self, uid: str) -> str | None:
@@ -61,11 +75,12 @@ class Store:
         return [p for p in papers if self.should_process(p.uid)]
 
     # --- 기록 ---
-    def _upsert(self, paper: Paper, status: str, error: str | None) -> None:
+    def _upsert(self, paper: Paper, status: str, error: str | None,
+                payload: str | None = None) -> None:
         self.conn.execute(
             """
-            INSERT INTO papers (uid, topic, title, source, status, judge_score, processed_at, error)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO papers (uid, topic, title, source, status, judge_score, processed_at, error, payload)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(uid) DO UPDATE SET
                 topic        = excluded.topic,
                 title        = excluded.title,
@@ -73,12 +88,14 @@ class Store:
                 status       = excluded.status,
                 judge_score  = excluded.judge_score,
                 processed_at = excluded.processed_at,
-                error        = excluded.error
+                error        = excluded.error,
+                payload      = excluded.payload
             """,
             (
                 paper.uid, paper.topic_name, paper.title, paper.source,
                 status, paper.judge_score, _now(),
                 error[:2000] if error else None,
+                payload,
             ),
         )
         self.conn.commit()
@@ -97,6 +114,64 @@ class Store:
         self._upsert(paper, new_status, error)
         if new_status == "failed_permanent":
             logger.warning("영구 skip 처리: %s (재시도도 실패)", paper.uid)
+
+    # --- pending 대기열 (쿼터 초과분, FIFO) ---
+    def mark_pending(self, paper: Paper) -> bool:
+        """필터 통과 후 쿼터에 밀린 논문을 대기열에 넣는다. Paper 전체를 payload(JSON)로 보존.
+
+        이미 pending이면 건드리지 않는다 — processed_at(=대기열 진입 시각)이 FIFO 순서이므로.
+        반환: 새로 추가됐으면 True.
+        """
+        if self._status(paper.uid) == "pending":
+            return False
+        payload = json.dumps(dataclasses.asdict(paper), ensure_ascii=False)
+        self._upsert(paper, "pending", None, payload=payload)
+        return True
+
+    def load_pending(self, topic: str, source: str) -> list[Paper]:
+        """topic × source의 대기열을 오래된 순(FIFO)으로 반환."""
+        rows = self.conn.execute(
+            "SELECT uid, payload FROM papers WHERE status='pending' AND topic=? AND source=? "
+            "ORDER BY processed_at ASC",
+            (topic, source),
+        ).fetchall()
+        out: list[Paper] = []
+        for r in rows:
+            if not r["payload"]:
+                logger.warning("pending 레코드에 payload 없음 — 건너뜀: %s", r["uid"])
+                continue
+            try:
+                out.append(Paper(**json.loads(r["payload"])))
+            except (TypeError, ValueError) as e:
+                logger.warning("pending payload 복원 실패 — 건너뜀: %s (%s)", r["uid"], e)
+        return out
+
+    def load_all_pending(self, topics: list[str]) -> list[Paper]:
+        """모든 (topic, source) 대기열을 합쳐 FIFO로 반환 — apply_quota 입력용."""
+        out: list[Paper] = []
+        for t in topics:
+            for src in ("semantic_scholar", "arxiv"):
+                out.extend(self.load_pending(t, src))
+        return out
+
+    def count_pending(self) -> dict[tuple[str, str], int]:
+        rows = self.conn.execute(
+            "SELECT topic, source, COUNT(*) AS n FROM papers WHERE status='pending' GROUP BY topic, source"
+        ).fetchall()
+        return {(r["topic"], r["source"]): r["n"] for r in rows}
+
+    def expire_pending(self, max_age_days: int) -> int:
+        """max_age_days보다 오래 대기한 pending을 'expired'로 폐기. 0이면 비활성. 반환: 폐기 수."""
+        if max_age_days <= 0:
+            return 0
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=max_age_days)).isoformat()
+        cur = self.conn.execute(
+            "UPDATE papers SET status='expired', error=?, payload=NULL "
+            "WHERE status='pending' AND processed_at < ?",
+            (f"pending {max_age_days}일 초과", cutoff),
+        )
+        self.conn.commit()
+        return cur.rowcount
 
     def close(self) -> None:
         self.conn.close()

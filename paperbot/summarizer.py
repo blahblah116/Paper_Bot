@@ -85,23 +85,33 @@ def chat(
     *,
     temperature: float | None = None,
     max_tokens: int | None = None,
+    response_format: dict | None = None,
     label: str = "llm",
 ) -> str:
     """지수 백오프 재시도(3회)를 포함한 chat completion. 실패 시 LLMError.
 
     max_tokens 미지정 시 config의 max_output_tokens 사용 — 폭주 생성 방지.
     (Ollama OpenAI 호환은 max_tokens를 num_predict로 매핑함)
+    thinking은 항상 끈다(reasoning_effort="none") — 요약·judge 모두 답이 입력에 있어
+    추론 이득이 거의 없고, thinking이 max_tokens를 잡아먹어 빈 응답이 나는 사고를 막는다.
+    (Ollama 0.34 실측: extra_body의 think 옵션은 무시되고 reasoning_effort만 동작.)
+    response_format은 OpenAI 호환 json_schema — 서버가 출력 형식을 강제한다.
     """
     last_err: Exception | None = None
     for attempt in range(1, _MAX_RETRIES + 1):
         try:
+            kwargs = {}
+            if response_format is not None:
+                kwargs["response_format"] = response_format
             resp = client.chat.completions.create(
                 model=cfg.llm.model,
                 messages=messages,
                 temperature=cfg.llm.temperature if temperature is None else temperature,
                 max_tokens=cfg.llm.max_output_tokens if max_tokens is None else max_tokens,
+                reasoning_effort="none",
                 # Ollama 전용 옵션 — 컨텍스트 길이를 요청 단위로 명시.
                 extra_body={"num_ctx": cfg.llm.num_ctx},
+                **kwargs,
             )
             content = _clean_output(resp.choices[0].message.content)
             if not content:

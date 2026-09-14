@@ -149,6 +149,37 @@ with tempfile.TemporaryDirectory() as d:
     check("failed 2회 → 영구 skip", st.should_process(c.uid) is False)
     st.close()
 
+print("== pending 대기열 (쿼터 초과분 FIFO) ==")
+import time as _t
+with tempfile.TemporaryDirectory() as d:
+    st = Store(os.path.join(d, "p.db"))
+    p1 = paper(uid="arxiv:1111.00001", source="arxiv", topic_name="t1"); p1.judge_score = 8.0
+    p2 = paper(uid="arxiv:1111.00002", source="arxiv", topic_name="t1")
+    p3 = paper(uid="s2:abc", source="semantic_scholar", topic_name="t1")
+    check("mark_pending 신규 → True", st.mark_pending(p1) is True)
+    _t.sleep(0.01); st.mark_pending(p2); st.mark_pending(p3)
+    check("pending → should_process False (재채점 방지)", st.should_process(p1.uid) is False)
+    check("mark_pending 중복 → False (FIFO 시각 보존)", st.mark_pending(p1) is False)
+    q = st.load_pending("t1", "arxiv")
+    check("load_pending FIFO 순서·소스 분리", [p.uid for p in q] == [p1.uid, p2.uid])
+    check("payload 복원(judge_score·pdf_url)", q[0].judge_score == 8.0 and q[0].pdf_url == p1.pdf_url and q[0].topic_name == "t1")
+    check("load_all_pending 합산", len(st.load_all_pending(["t1"])) == 3)
+    check("count_pending", st.count_pending() == {("t1", "arxiv"): 2, ("t1", "semantic_scholar"): 1})
+    st.mark_done(q[0])
+    check("pending → done 전이", st._status(p1.uid) == "done" and len(st.load_pending("t1", "arxiv")) == 1)
+    check("expire 0 = 비활성", st.expire_pending(0) == 0)
+    st.conn.execute("UPDATE papers SET processed_at='2000-01-01T00:00:00+00:00' WHERE uid=?", (p2.uid,)); st.conn.commit()
+    check("expire: 오래된 것만 폐기", st.expire_pending(30) == 1 and st._status(p2.uid) == "expired" and st._status(p3.uid) == "pending")
+    st.close()
+    # 구 스키마(payload 없음) DB 마이그레이션
+    import sqlite3 as _sq
+    old = os.path.join(d, "old.db"); c = _sq.connect(old)
+    c.execute("CREATE TABLE papers (uid TEXT PRIMARY KEY, topic TEXT, title TEXT, source TEXT, status TEXT, judge_score REAL, processed_at TEXT, error TEXT)")
+    c.execute("INSERT INTO papers VALUES ('arxiv:1', 't', 'x', 'arxiv', 'done', NULL, '2026-01-01', NULL)"); c.commit(); c.close()
+    st2 = Store(old)
+    check("구 DB 마이그레이션(payload 추가, 기존 행 유지)", st2.should_process("arxiv:1") is False and st2.mark_pending(paper(uid="arxiv:2")) is True)
+    st2.close()
+
 print("== 발행 쿼터 ==")
 from run import apply_quota
 check("quota 로드", cfg.quota.s2_per_topic == 3 and cfg.quota.arxiv_per_topic == 2)

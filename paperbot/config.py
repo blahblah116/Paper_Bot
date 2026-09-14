@@ -57,11 +57,13 @@ class FetchConfig:
 class QuotaConfig:
     """실행(=하루)당 topic(채널)별 발행 상한. 0 = 무제한.
 
-    필터를 통과한 논문 중 소스별 최신순으로 상한만큼만 발행하고,
-    초과분은 DB에 기록하지 않아 다음 실행 때 자연스럽게 이월된다.
+    필터를 통과한 논문 중 소스별로 상한만큼만 발행한다. 초과분은 DB에 pending으로 적재되어
+    다음 실행에서 오래된 순(FIFO)으로 먼저 쿼터를 채운다.
+    pending_max_age_days: 이보다 오래 대기한 pending은 폐기(expired). 0 = 무제한.
     """
     s2_per_topic: int = 0
     arxiv_per_topic: int = 0
+    pending_max_age_days: int = 30
 
 
 @dataclass(frozen=True)
@@ -242,8 +244,9 @@ def load_config(path: str) -> Config:
     quota = QuotaConfig(
         s2_per_topic=int(quota_d.get("s2_per_topic", 0)),
         arxiv_per_topic=int(quota_d.get("arxiv_per_topic", 0)),
+        pending_max_age_days=int(quota_d.get("pending_max_age_days", 30)),
     )
-    if quota.s2_per_topic < 0 or quota.arxiv_per_topic < 0:
+    if quota.s2_per_topic < 0 or quota.arxiv_per_topic < 0 or quota.pending_max_age_days < 0:
         raise ConfigError("quota 값은 0(무제한) 이상이어야 합니다.")
 
     # --- filter ---
