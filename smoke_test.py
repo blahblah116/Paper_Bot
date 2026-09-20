@@ -180,14 +180,100 @@ with tempfile.TemporaryDirectory() as d:
     check("구 DB 마이그레이션(payload 추가, 기존 행 유지)", st2.should_process("arxiv:1") is False and st2.mark_pending(paper(uid="arxiv:2")) is True)
     st2.close()
 
+print("== S2 인용순 커서 (기존 논문 스킵 + 페이지 기억) ==")
+from dataclasses import replace as _rp2
+from paperbot.config import Topic as _Topic, S2SourceConfig as _S2C
+from paperbot.sources.semantic_scholar import _BadRequest
+
+def _s2item(i, pub="2025-01-01"):
+    return {"paperId": f"p{i}", "title": f"Paper {i}", "abstract": "x", "externalIds": {},
+            "citationCount": 1000 - i, "publicationDate": pub, "authors": []}
+
+class _FakeS2(SemanticScholarSource):
+    """_get만 가짜 페이지로 대체. pages: {token_or_None: (items, next_token)}."""
+    def __init__(self, cfg, store, pages):
+        super().__init__(cfg, store=store)
+        self.pages = pages; self.calls = []
+    def _get(self, params):
+        tok = params.get("token")
+        self.calls.append(tok)
+        if tok not in self.pages:
+            raise _BadRequest("bad token")
+        items, nxt = self.pages[tok]
+        return {"data": items, "token": nxt}
+
+_ccfg = _rp2(cfg, fetch=_rp2(cfg.fetch, max_results_per_query=3, s2_lookback_days=0, s2_max_pages_per_run=2))
+_ctopic = _Topic(name="ct", interest="x", s2=_S2C(query="q", sort="citations", year="2020-"))
+_rtopic = _Topic(name="rt", interest="x", s2=_S2C(query="q", sort="recency"))
+with tempfile.TemporaryDirectory() as d:
+    st = Store(os.path.join(d, "c.db"))
+    check("커서 없음 → None", st.get_s2_cursor("ct") is None)
+    st.save_s2_cursor("ct", "k", "T1", 1)
+    cur = st.get_s2_cursor("ct")
+    check("커서 저장/복원", cur["query_key"] == "k" and cur["token"] == "T1" and cur["pages_done"] == 1)
+    st.clear_s2_cursor("ct")
+    check("커서 삭제", st.get_s2_cursor("ct") is None)
+
+    # 1페이지 5편(0~4), 2페이지 3편(5~7), 끝. max_results=3.
+    pages = {None: ([_s2item(i) for i in range(5)], "T2"), "T2": ([_s2item(i) for i in range(5, 8)], None)}
+    src = _FakeS2(_ccfg, st, pages)
+    # 실행 1: 1페이지에서 0,1,2 수집 → 페이지 중간에서 멈춤 → 커서는 1페이지에 머묾
+    out = src.fetch(_ctopic)
+    check("실행1: 미처리 3편", [p.uid for p in out] == ["s2:p0", "s2:p1", "s2:p2"])
+    cur = st.get_s2_cursor("ct")
+    check("실행1: 커서 1페이지 유지(중간 정지)", cur is not None and cur["token"] is None and cur["pages_done"] == 0)
+    for p in out: st.mark_done(p)
+    # 실행 2: 1페이지 재요청, 0~2 스킵 → 3,4 수집, 페이지 끝 → 2페이지로 전진, 5 수집 → 중간 정지
+    src.calls.clear(); out = src.fetch(_ctopic)
+    check("실행2: 기존 스킵 후 3,4,5 수집", [p.uid for p in out] == ["s2:p3", "s2:p4", "s2:p5"])
+    check("실행2: 1→2페이지 요청", src.calls == [None, "T2"])
+    cur = st.get_s2_cursor("ct")
+    check("실행2: 커서 2페이지로 전진", cur["token"] == "T2" and cur["pages_done"] == 1)
+    for p in out: st.mark_done(p)
+    # 실행 3: 1페이지는 건너뛰고 2페이지만 요청, 6,7 수집, 마지막 페이지 → 소진 → 커서 리셋
+    src.calls.clear(); out = src.fetch(_ctopic)
+    check("실행3: 1페이지 안 찾고 2페이지부터", src.calls == ["T2"])
+    check("실행3: 남은 6,7 수집", [p.uid for p in out] == ["s2:p6", "s2:p7"])
+    check("실행3: 소진 → 커서 리셋", st.get_s2_cursor("ct") is None)
+    # failed 상태(1회 실패)는 재처리 대상이므로 스킵하지 않음
+    st.mark_failed(paper(uid="s2:p0", source="semantic_scholar", topic_name="ct"), "e")
+    out = src.fetch(_ctopic)
+    check("failed 1회는 스킵 안 함(재시도)", "s2:p0" in [p.uid for p in out])
+    # 쿼리 변경 → 커서 리셋
+    st.save_s2_cursor("ct", "stale-key", "T2", 1)
+    src.calls.clear(); src.fetch(_ctopic)
+    check("쿼리 변경 → 1페이지부터", src.calls[0] is None)
+    # 저장된 토큰 무효(400) → 리셋 후 1페이지부터 1회 재시작
+    qk = SemanticScholarSource._query_key(src._build_params(_ctopic.s2))
+    st.save_s2_cursor("ct", qk, "EXPIRED", 3)
+    src.calls.clear(); out = src.fetch(_ctopic)
+    check("토큰 무효 → 리셋 후 1페이지 재시작", src.calls[:2] == ["EXPIRED", None] and len(out) > 0)
+    # 페이지 상한: 전부 기존 논문이면 s2_max_pages_per_run(2)까지만 요청
+    for i in range(8): st.mark_done(paper(uid=f"s2:p{i}", source="semantic_scholar", topic_name="ct"))
+    big = {None: ([_s2item(i) for i in range(8)], "A"), "A": ([_s2item(i) for i in range(8)], "B"), "B": ([_s2item(9)], None)}
+    src2 = _FakeS2(_ccfg, st, big); st.clear_s2_cursor("ct")
+    out = src2.fetch(_ctopic)
+    check("페이지 상한 준수(2페이지)", src2.calls == [None, "A"] and out == [])
+    check("상한 도달 시 커서는 다음 페이지", st.get_s2_cursor("ct")["token"] == "B")
+    # recency topic은 커서/스킵 미적용(기존 동작)
+    src3 = _FakeS2(_ccfg, st, pages)
+    out = src3.fetch(_rtopic)
+    check("recency: 기존 논문도 그대로 앞 3편", [p.uid for p in out] == ["s2:p0", "s2:p1", "s2:p2"])
+    check("recency: 커서 저장 안 함", st.get_s2_cursor("rt") is None)
+    # store 없음(backfill·테스트) → 기존 동작
+    src4 = _FakeS2(_ccfg, None, pages)
+    check("store 없음: 기존 동작", len(src4.fetch(_ctopic)) == 3 and src4.calls == [None])
+    st.close()
+
 print("== 발행 쿼터 ==")
 from run import apply_quota
-check("quota 로드", cfg.quota.s2_per_topic == 3 and cfg.quota.arxiv_per_topic == 2)
+from paperbot.config import QuotaConfig
+check("quota 로드(값은 사용자 튜닝 영역)", cfg.quota.s2_per_topic >= 0 and cfg.quota.arxiv_per_topic >= 0)
 def mkq(i, src, topic="t1"):
     return paper(uid=f"q:{topic}:{src}:{i}", source=src, topic_name=topic)
 mix = ([mkq(i, "semantic_scholar") for i in range(5)] + [mkq(i, "arxiv") for i in range(4)]
        + [mkq(i, "semantic_scholar", "t2") for i in range(2)])
-q = cfg.quota
+q = QuotaConfig(s2_per_topic=3, arxiv_per_topic=2)  # 테스트용 고정값 (config.yaml 튜닝과 무관)
 out = apply_quota(mix, q)
 s2_t1 = [p for p in out if p.source == "semantic_scholar" and p.topic_name == "t1"]
 ax_t1 = [p for p in out if p.source == "arxiv" and p.topic_name == "t1"]
@@ -196,7 +282,6 @@ check("t1 S2 상한 3", len(s2_t1) == 3)
 check("t1 arXiv 상한 2", len(ax_t1) == 2)
 check("t2는 독립 카운트(2편 전부)", len(s2_t2) == 2)
 check("최신순(입력 순서) 유지", [p.uid for p in s2_t1] == [f"q:t1:semantic_scholar:{i}" for i in range(3)])
-from paperbot.config import QuotaConfig
 check("0 = 무제한", len(apply_quota(mix, QuotaConfig(0, 0))) == len(mix))
 
 print("== filter: judge JSON 파싱 ==")

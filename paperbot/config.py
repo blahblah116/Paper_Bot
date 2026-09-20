@@ -50,6 +50,7 @@ class FetchConfig:
     max_results_per_query: int = 50
     arxiv_lookback_days: int = 3
     s2_lookback_days: int = 180    # 0 = lookback 비활성 (topic별 year 필터에 위임)
+    s2_max_pages_per_run: int = 3  # 인용순 topic: 실행당 넘길 최대 bulk 페이지 수(1페이지=1000건)
     unpaywall_email: str = ""      # Unpaywall PDF 구조용 식별 이메일 (비우면 Unpaywall 미사용)
 
 
@@ -229,6 +230,7 @@ def load_config(path: str) -> Config:
         max_results_per_query=int(fetch_d.get("max_results_per_query", 50)),
         arxiv_lookback_days=int(fetch_d.get("arxiv_lookback_days", 3)),
         s2_lookback_days=int(fetch_d.get("s2_lookback_days", 180)),
+        s2_max_pages_per_run=int(fetch_d.get("s2_max_pages_per_run", 3)),
         unpaywall_email=str(fetch_d.get("unpaywall_email", "")).strip(),
     )
     if fetch.max_results_per_query <= 0:
@@ -238,6 +240,8 @@ def load_config(path: str) -> Config:
         raise ConfigError("fetch.arxiv_lookback_days는 1 이상이어야 합니다.")
     if fetch.s2_lookback_days < 0:
         raise ConfigError("fetch.s2_lookback_days는 0(비활성 — year에 위임) 이상이어야 합니다.")
+    if fetch.s2_max_pages_per_run <= 0:
+        raise ConfigError("fetch.s2_max_pages_per_run은 1 이상이어야 합니다.")
 
     # --- quota ---
     quota_d = _as_dict(raw.get("quota"), "quota")

@@ -1,5 +1,9 @@
 """sqlite 기반 중복/상태 관리 (v2 — uid 키).
 
+s2_cursor 테이블: S2 인용순 topic의 페이지 커서(bulk 검색 continuation token).
+  한 페이지의 항목을 전부 스캔(기존 논문 스킵)한 뒤에만 다음 토큰으로 전진하므로,
+  다음 실행은 이미 소진한 페이지를 다시 요청하지 않는다. 쿼리 파라미터가 바뀌면 리셋.
+
 status 값:
   done              요약·포스팅 완료 → 재처리 안 함
   filtered_out      relevance 필터 탈락 → 재채점하지 않도록 기록
@@ -36,6 +40,13 @@ CREATE TABLE IF NOT EXISTS papers (
     error        TEXT,
     payload      TEXT
 );
+CREATE TABLE IF NOT EXISTS s2_cursor (
+    topic        TEXT PRIMARY KEY,
+    query_key    TEXT,
+    token        TEXT,
+    pages_done   INTEGER NOT NULL DEFAULT 0,
+    updated_at   TEXT
+);
 """
 
 
@@ -48,7 +59,7 @@ class Store:
         os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
         self.conn = sqlite3.connect(db_path)
         self.conn.row_factory = sqlite3.Row
-        self.conn.execute(_SCHEMA)
+        self.conn.executescript(_SCHEMA)
         self._migrate()
         self.conn.commit()
 
@@ -172,6 +183,36 @@ class Store:
         )
         self.conn.commit()
         return cur.rowcount
+
+    # --- S2 페이지 커서 (인용순 topic의 bulk 검색 continuation token) ---
+    def get_s2_cursor(self, topic: str) -> dict | None:
+        """topic의 저장된 커서. 없으면 None.
+        반환 dict: {query_key, token, pages_done, updated_at}. token None = 1페이지부터."""
+        row = self.conn.execute(
+            "SELECT query_key, token, pages_done, updated_at FROM s2_cursor WHERE topic = ?", (topic,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def save_s2_cursor(self, topic: str, query_key: str, token: str | None, pages_done: int) -> None:
+        """커서 저장(upsert). token은 '다음에 요청할 페이지'의 토큰(None = 1페이지)."""
+        self.conn.execute(
+            """
+            INSERT INTO s2_cursor (topic, query_key, token, pages_done, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(topic) DO UPDATE SET
+                query_key  = excluded.query_key,
+                token      = excluded.token,
+                pages_done = excluded.pages_done,
+                updated_at = excluded.updated_at
+            """,
+            (topic, query_key, token, pages_done, _now()),
+        )
+        self.conn.commit()
+
+    def clear_s2_cursor(self, topic: str) -> None:
+        """커서 삭제 — 결과 소진(마지막 페이지 도달)·쿼리 변경·토큰 무효 시 1페이지부터 다시."""
+        self.conn.execute("DELETE FROM s2_cursor WHERE topic = ?", (topic,))
+        self.conn.commit()
 
     def close(self) -> None:
         self.conn.close()

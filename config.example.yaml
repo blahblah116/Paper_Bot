@@ -43,6 +43,10 @@ fetch:
   arxiv_lookback_days: 14     # arXiv 신선도 창 — 최근 N일 제출분만
   s2_lookback_days: 0         # 0 = lookback 비활성, 시간 범위를 topic별 year에 위임 (권장).
                               # 논문이 min_citations 문턱을 넘는 순간 신규로 잡힘.
+  s2_max_pages_per_run: 3     # 인용순(sort: citations) topic 전용. 이미 DB에 있는 논문은 건너뛰고
+                              # 미처리 논문이 max_results_per_query편 모일 때까지 페이지를 넘김(1페이지=1000건).
+                              # 페이지 커서는 DB(s2_cursor)에 저장 → 다 스캔한 페이지는 다음 실행에서 요청 안 함.
+                              # 마지막 페이지까지 소진하면 커서를 리셋해 1페이지부터 다시 훑음(순위 변동 반영).
   unpaywall_email: ""         # PDF 403 시 Unpaywall로 합법 OA 사본 조회 (본인 이메일, 비우면 미사용)
 
 quota:

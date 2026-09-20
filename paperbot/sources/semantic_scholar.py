@@ -10,9 +10,18 @@
   * 429는 Retry-After 헤더를 따르고, 없으면 최소 2초 백오프.
   * 5xx/연결 오류는 지수 백오프. 재시도 총 3회, 마지막 시도 실패엔 대기 없음.
 - bulk 검색은 날짜 정렬이 아니므로 lookback은 아이템 단위로 필터한다(조기 중단 없음).
+- 인용순(sort: citations) topic은 상위 N편이 날마다 거의 같아 한 번 처리하면 신규가 0이 된다.
+  그래서 store가 주어지면 **이미 DB에 있는 논문은 건너뛰고** 미처리 논문이 max_results편
+  모일 때까지 페이지(1페이지=1000건)를 넘기며, 페이지 커서(token)를 DB(s2_cursor)에 저장한다.
+  한 페이지를 끝까지 스캔한 뒤에만 커서를 다음 토큰으로 전진시키므로, 다음 실행은 소진한
+  페이지를 다시 요청하지 않는다. 마지막 페이지까지 소진하면 커서를 리셋해 1페이지부터 다시
+  훑는다(인용 순위 변동으로 새로 진입한 논문 반영). 쿼리 파라미터가 바뀌거나 토큰이 무효
+  (HTTP 400)면 리셋. 최신순(recency) topic은 새 논문이 1페이지 맨 앞에 붙으므로 커서를 쓰지 않는다.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import threading
@@ -21,8 +30,9 @@ from datetime import datetime, timedelta, timezone
 
 import requests
 
-from ..config import Topic
+from ..config import Config, Topic
 from ..models import Paper, arxiv_base_id, make_uid
+from ..store import Store
 from .base import PaperSource
 
 logger = logging.getLogger(__name__)
@@ -73,11 +83,18 @@ class _AuthRejected(RuntimeError):
     """401/403 — 키 문제. 재시도 없이 즉시 실패해야 한다."""
 
 
+class _BadRequest(RuntimeError):
+    """400 — 파라미터/토큰 문제. 재시도해도 같으므로 즉시 실패. 저장된 커서 토큰 무효 판정에 쓴다."""
+
+
 class SemanticScholarSource(PaperSource):
     name = "semantic_scholar"
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, cfg: Config, *, backfill: bool = False, store: Store | None = None):
+        super().__init__(cfg, backfill=backfill)
+        # store가 있으면 인용순 topic에서 기존 논문 스킵 + 페이지 커서 저장/복원.
+        # None(예: 단위 테스트, backfill)이면 기존 동작(1페이지 앞 max_results편).
+        self.store = store
         self.session = requests.Session()
         self.api_key = os.environ.get("S2_API_KEY", "").strip()
         if self.api_key:
@@ -108,6 +125,9 @@ class SemanticScholarSource(PaperSource):
                     except ValueError:
                         retry_after = None
                     raise _RateLimited(retry_after)
+                if resp.status_code == 400:
+                    body = (resp.text or "")[:200]
+                    raise _BadRequest(f"S2 요청 거부 (HTTP 400): {body}")
                 if resp.status_code in (401, 403):
                     # 잘못된/비활성 키 — 재시도해도 소용없으므로 즉시 명확히 실패.
                     raise _AuthRejected(
@@ -118,8 +138,8 @@ class SemanticScholarSource(PaperSource):
                     raise requests.HTTPError(f"HTTP {resp.status_code}", response=resp)
                 resp.raise_for_status()
                 return resp.json()
-            except _AuthRejected:
-                raise  # 키 문제는 재시도 없이 즉시 상위로 (topic 단위 실패 처리)
+            except (_AuthRejected, _BadRequest):
+                raise  # 키/파라미터 문제는 재시도 없이 즉시 상위로
             except _RateLimited as e:
                 last_err = e
                 # Retry-After가 있으면 따르고, 없으면 최소 2초 + 지수 백오프.
@@ -189,11 +209,13 @@ class SemanticScholarSource(PaperSource):
 
     # ------------------------------------------------------------- fetch
 
-    def fetch(self, topic: Topic) -> list[Paper]:
-        if topic.s2 is None:
-            return []
+    @staticmethod
+    def _query_key(params: dict) -> str:
+        """검색 파라미터(token 제외)의 해시 — 쿼리가 바뀌면 저장된 커서를 무효화하기 위함."""
+        base = {k: v for k, v in params.items() if k not in ("token", "fields")}
+        return hashlib.sha1(json.dumps(base, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]
 
-        s2 = topic.s2
+    def _build_params(self, s2) -> dict:
         # 정렬 명시 — 미지정 시 bulk는 paperId 순(사실상 무작위)이라
         # 앞 max_results건만 보는 우리 로직이 원하는 논문을 놓친다.
         #   recency   → publicationDate:desc (최신순, 기본)
@@ -206,13 +228,39 @@ class SemanticScholarSource(PaperSource):
             params["year"] = s2.year
         if s2.min_citations > 0:
             params["minCitationCount"] = str(s2.min_citations)
+        return params
+
+    def _passes_lookback(self, item: dict, cutoff: datetime) -> bool:
+        pub = item.get("publicationDate")  # "YYYY-MM-DD" 또는 None
+        if not pub:
+            return True
+        try:
+            pub_dt = datetime.strptime(pub, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            return True  # 날짜 형식 이상 → 필터하지 않고 통과
+        return pub_dt >= cutoff
+
+    def fetch(self, topic: Topic) -> list[Paper]:
+        if topic.s2 is None:
+            return []
+
+        s2 = topic.s2
+        params = self._build_params(s2)
 
         # lookback: 0이면 비활성 — topic의 year 필터에 시간 범위를 위임.
         lookback_days = self.cfg.fetch.s2_lookback_days
         use_lookback = (not self.backfill) and lookback_days > 0
         cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
-        max_results = self.cfg.fetch.max_results_per_query
 
+        # 인용순 + store 있음 + backfill 아님 → 기존 논문 스킵 + 페이지 커서 모드.
+        if s2.sort == "citations" and self.store is not None and not self.backfill:
+            return self._fetch_citations_cursor(topic, params, use_lookback, cutoff)
+        return self._fetch_plain(topic, params, s2.sort, use_lookback, cutoff)
+
+    def _fetch_plain(self, topic: Topic, params: dict, sort: str,
+                     use_lookback: bool, cutoff: datetime) -> list[Paper]:
+        """기존 동작: 1페이지 앞에서부터 max_results편 (최신순 topic, backfill, store 없음)."""
+        max_results = self.cfg.fetch.max_results_per_query
         papers: list[Paper] = []
         seen_pages = 0
         token: str | None = None
@@ -227,27 +275,17 @@ class SemanticScholarSource(PaperSource):
             for item in data.get("data") or []:
                 if len(papers) >= max_results:
                     break
-
                 paper = self._to_paper(item, topic.name)
                 if paper is None:
                     continue
-
                 # lookback 필터 (--backfill 또는 s2_lookback_days=0이면 미적용).
                 # 최신순 정렬일 때만 "이후는 전부 더 오래됨"이 성립해 조기 중단 가능.
                 # 인용순 정렬은 날짜 순서가 아니므로 아이템 단위로만 건너뛴다.
-                if use_lookback:
-                    pub = item.get("publicationDate")  # "YYYY-MM-DD" 또는 None
-                    if pub:
-                        try:
-                            pub_dt = datetime.strptime(pub, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-                            if pub_dt < cutoff:
-                                if s2.sort == "recency":
-                                    reached_cutoff = True
-                                    break
-                                continue  # citations 정렬: 이 아이템만 스킵
-                        except ValueError:
-                            pass  # 날짜 형식 이상 → 필터하지 않고 통과
-
+                if use_lookback and not self._passes_lookback(item, cutoff):
+                    if sort == "recency":
+                        reached_cutoff = True
+                        break
+                    continue
                 papers.append(paper)
 
             token = data.get("token")
@@ -260,5 +298,97 @@ class SemanticScholarSource(PaperSource):
             topic.name, len(papers), seen_pages,
             ", lookback 도달" if reached_cutoff else "",
             ", backfill" if self.backfill else "",
+        )
+        return papers
+
+    def _fetch_citations_cursor(self, topic: Topic, params: dict,
+                                use_lookback: bool, cutoff: datetime) -> list[Paper]:
+        """인용순 topic: DB에 있는 논문은 건너뛰고 미처리 논문이 max_results편 모일 때까지 페이지를 넘긴다.
+
+        커서(token)는 '다음에 요청할 페이지'를 가리킨다. 한 페이지의 항목을 전부 스캔했을 때만
+        전진시키고, max_results를 채워 중간에 멈추면 같은 페이지에 머문다(남은 항목은 다음 실행에서
+        기존 논문 스킵을 거쳐 이어서 수집). 실행당 페이지 수는 s2_max_pages_per_run으로 제한.
+        """
+        store = self.store
+        assert store is not None
+        max_results = self.cfg.fetch.max_results_per_query
+        max_pages = self.cfg.fetch.s2_max_pages_per_run
+        qkey = self._query_key(params)
+
+        token: str | None = None
+        pages_done = 0
+        cur = store.get_s2_cursor(topic.name)
+        if cur is not None:
+            if cur["query_key"] != qkey:
+                logger.info("S2 '%s': 쿼리 변경 감지 — 페이지 커서 리셋", topic.name)
+                store.clear_s2_cursor(topic.name)
+            else:
+                token, pages_done = cur["token"], int(cur["pages_done"] or 0)
+        start_page = pages_done + 1
+
+        papers: list[Paper] = []
+        skipped_known = 0
+        skipped_lookback = 0
+        seen_pages = 0
+        exhausted = False
+        restarted = False
+
+        while len(papers) < max_results and seen_pages < max_pages:
+            if token:
+                params["token"] = token
+            else:
+                params.pop("token", None)
+            try:
+                data = self._get(params)
+            except _BadRequest:
+                if token and not restarted:
+                    # 저장된 continuation token이 만료/무효 → 1페이지부터 재시작 (1회만).
+                    logger.warning("S2 '%s': 저장된 페이지 토큰 무효 — 커서 리셋 후 1페이지부터", topic.name)
+                    store.clear_s2_cursor(topic.name)
+                    token, pages_done, restarted = None, 0, True
+                    start_page = 1
+                    continue
+                raise
+            seen_pages += 1
+
+            items = data.get("data") or []
+            page_complete = True
+            for item in items:
+                if len(papers) >= max_results:
+                    page_complete = False  # 이 페이지에 아직 안 본 항목이 남음 → 커서 유지
+                    break
+                paper = self._to_paper(item, topic.name)
+                if paper is None:
+                    continue
+                if not store.should_process(paper.uid):
+                    skipped_known += 1
+                    continue
+                if use_lookback and not self._passes_lookback(item, cutoff):
+                    skipped_lookback += 1
+                    continue
+                papers.append(paper)
+
+            next_token = data.get("token")
+            if page_complete:
+                pages_done += 1
+                if not next_token:
+                    exhausted = True
+                    break
+                token = next_token
+            # page_complete=False면 token 그대로(같은 페이지에 머무름).
+
+        if exhausted:
+            # 마지막 페이지까지 다 봤음 → 다음 실행은 1페이지부터 (순위 변동으로 새로 진입한 논문 반영).
+            logger.info("S2 '%s': 결과 소진 (%d페이지) — 커서 리셋, 다음 실행은 1페이지부터",
+                        topic.name, pages_done)
+            store.clear_s2_cursor(topic.name)
+        else:
+            store.save_s2_cursor(topic.name, qkey, token, pages_done)
+
+        logger.info(
+            "S2 '%s': %d편 수집 (인용순 커서: %d페이지 요청, 시작 페이지 %d, 기존 논문 %d편 스킵%s%s)",
+            topic.name, len(papers), seen_pages, start_page, skipped_known,
+            f", lookback 스킵 {skipped_lookback}편" if skipped_lookback else "",
+            ", 소진→리셋" if exhausted else "",
         )
         return papers

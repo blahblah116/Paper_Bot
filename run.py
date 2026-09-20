@@ -108,14 +108,16 @@ def release_lock(path: str) -> None:
 
 # ---------------------------------------------------------------- 파이프라인
 
-def fetch_all(cfg: Config, backfill: bool) -> list[Paper]:
+def fetch_all(cfg: Config, backfill: bool, store: Store | None = None) -> list[Paper]:
     """모든 topic × 소스를 검색하고 uid로 dedupe한 리스트를 반환.
 
     S2가 주 소스이므로 topic마다 S2 → arXiv 순으로 수집한다
     (중복 시 메타데이터가 풍부한 S2 레코드가 남는다).
     소스 하나가 실패해도 나머지는 계속 진행한다.
+    store를 넘기면 S2 인용순 topic이 DB 기존 논문을 건너뛰고 페이지 커서를 저장/복원한다.
     """
-    sources = [SemanticScholarSource(cfg, backfill=backfill), ArxivSource(cfg, backfill=backfill)]
+    sources = [SemanticScholarSource(cfg, backfill=backfill, store=store),
+               ArxivSource(cfg, backfill=backfill)]
     seen: set[str] = set()
     out: list[Paper] = []
 
@@ -206,9 +208,9 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
     client = summarizer.make_client(cfg)
     topics_by_name = {t.name: t for t in cfg.topics}
 
-    fetched = fetch_all(cfg, backfill=args.backfill)
-
     with Store(cfg.resolve(cfg.storage.db_path)) as store:
+        # store를 fetch에도 넘긴다 — S2 인용순 topic의 기존 논문 스킵 + 페이지 커서용.
+        fetched = fetch_all(cfg, backfill=args.backfill, store=store)
         todo = store.filter_unprocessed(fetched)
         logger.info("미처리 논문 %d편 (검색 %d편 중)", len(todo), len(fetched))
 
