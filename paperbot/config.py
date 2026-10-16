@@ -41,6 +41,8 @@ class Topic:
     arxiv: ArxivSourceConfig | None = None # None 또는 enabled=False면 arXiv 스킵
     channel: str | None = None             # 이 topic 전용 발행 대상(Slack 채널/Zulip 스트림).
                                            # None이면 backend의 기본값(slack.channel/zulip.stream) 사용.
+    quota_s2: int | None = None            # topic별 쿼터 오버라이드. None이면 quota.s2_per_topic 사용
+    quota_arxiv: int | None = None         # None이면 quota.arxiv_per_topic 사용. 0 = 무제한
 
 
 # ---------------------------------------------------------------- 섹션들
@@ -199,7 +201,23 @@ def _parse_topic(i: int, raw: Any) -> Topic:
     channel = t.get("channel")
     channel = str(channel).strip() if channel else None
 
-    return Topic(name=name, interest=interest, s2=s2, arxiv=arxiv, channel=channel)
+    # topic별 쿼터 오버라이드 (선택): quota: {s2: N, arxiv: N}. 없는 키는 전역 quota를 따른다.
+    quota_s2 = quota_arxiv = None
+    if t.get("quota") is not None:
+        q_d = _as_dict(t["quota"], f"{ctx}.quota")
+        unknown = set(q_d) - {"s2", "arxiv"}
+        if unknown:
+            raise ConfigError(f"{ctx}.quota에 알 수 없는 키: {sorted(unknown)} (허용: s2, arxiv)")
+        if "s2" in q_d and q_d["s2"] is not None:
+            quota_s2 = int(q_d["s2"])
+        if "arxiv" in q_d and q_d["arxiv"] is not None:
+            quota_arxiv = int(q_d["arxiv"])
+        for k, v in (("s2", quota_s2), ("arxiv", quota_arxiv)):
+            if v is not None and v < 0:
+                raise ConfigError(f"{ctx}.quota.{k}는 0(무제한) 이상이어야 합니다.")
+
+    return Topic(name=name, interest=interest, s2=s2, arxiv=arxiv, channel=channel,
+                 quota_s2=quota_s2, quota_arxiv=quota_arxiv)
 
 
 def load_config(path: str) -> Config:

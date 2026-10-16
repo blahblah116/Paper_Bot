@@ -138,20 +138,27 @@ def fetch_all(cfg: Config, backfill: bool, store: Store | None = None) -> list[P
     return out
 
 
-def apply_quota(papers: list[Paper], quota) -> list[Paper]:
+def apply_quota(papers: list[Paper], quota, topics_by_name: dict | None = None) -> list[Paper]:
     """topic(채널)×소스별 발행 상한 적용. 0이면 해당 소스 무제한.
 
     입력 순서를 유지한 채 (topic, source)별 앞에서부터 상한만큼 고른다.
     호출자는 [pending 대기열(오래된 순)] + [신규 필터 통과분(최신순)] 순서로 넘기므로
     대기열이 먼저(FIFO) 소진되고, 남은 자리를 신규 최신 논문이 채운다.
     선택되지 않은 신규분은 호출자가 store.mark_pending()으로 대기열에 넣는다.
+    topics_by_name을 주면 Topic.quota_s2 / quota_arxiv(topic별 오버라이드)가 전역 quota보다 우선한다.
     """
-    if quota.s2_per_topic <= 0 and quota.arxiv_per_topic <= 0:
-        return papers
+    topics_by_name = topics_by_name or {}
+
+    def cap_for(p: Paper) -> int:
+        t = topics_by_name.get(p.topic_name)
+        if p.source == "semantic_scholar":
+            return t.quota_s2 if t is not None and t.quota_s2 is not None else quota.s2_per_topic
+        return t.quota_arxiv if t is not None and t.quota_arxiv is not None else quota.arxiv_per_topic
+
     counts: dict[tuple[str, str], int] = {}
     out: list[Paper] = []
     for p in papers:
-        cap = quota.s2_per_topic if p.source == "semantic_scholar" else quota.arxiv_per_topic
+        cap = cap_for(p)
         if cap <= 0:
             out.append(p)
             continue
@@ -235,7 +242,7 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
         # topic(채널)×소스별 일일 발행 쿼터 — 대기열 먼저, 남은 자리는 신규 최신순.
         # 선택되지 않은 신규분은 pending으로 적재해 다음 실행에서 우선 처리한다.
         candidates = pending + passed
-        selected = apply_quota(candidates, cfg.quota)
+        selected = apply_quota(candidates, cfg.quota, topics_by_name)
         if args.limit is not None:
             selected = selected[: args.limit]
             logger.info("--limit 적용: %d편만 처리", len(selected))

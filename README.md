@@ -155,7 +155,7 @@ topics:
 | | `arxiv_lookback_days` | 14 | arXiv 제출일 창. arXiv엔 서버측 연도 필터가 없어 필수(≥1) |
 | | `s2_lookback_days` | 0 | 0 = 비활성, 시간 범위를 topic `year`에 위임 (권장) |
 | | `unpaywall_email` | 설정됨 | PDF 403 시 Unpaywall OA 사본 조회. 비우면 생략 |
-| `quota` | `s2_per_topic` / `arxiv_per_topic` | 2 / 1 | 실행당 채널·소스별 발행 상한. 0 = 무제한 |
+| `quota` | `s2_per_topic` / `arxiv_per_topic` | 2 / 1 | 실행당 채널·소스별 발행 상한. 0 = 무제한. topic 항목의 `quota: {s2, arxiv}`로 개별 덮어쓰기 가능 |
 | | `pending_max_age_days` | 30 | 이보다 오래 대기한 pending 폐기. 0 = 무제한 |
 | `filter` | `embedding_model` / `embedding_device` | MiniLM-L6-v2 / cpu | 임베딩 프리필터 |
 | | `embedding_threshold` | 0.25 | interest↔title+abstract cosine 하한 |
@@ -225,6 +225,7 @@ abstract가 없는 논문은 제목만으로 점수를 내되 하드컷하지 �
 ## 7. 발행 쿼터와 pending 대기열
 
 `quota.s2_per_topic` / `quota.arxiv_per_topic`은 실행(=하루)당 채널·소스별 발행 상한이다.
+특정 topic만 다르게 두려면 그 topic 항목에 `quota: {s2: N, arxiv: N}`을 적는다 (빠진 키는 전역값, 0 = 무제한).
 
 ```
 후보 = [pending 대기열 (topic×소스별 오래된 순)] + [신규 필터 통과분 (최신순)]

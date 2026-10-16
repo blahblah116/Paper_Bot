@@ -16,3 +16,6 @@ __pycache__/
 .venv/
 venv/
 *.egg-info/
+
+# 로컬 후속 작업 훅 (서버별 설정)
+scripts/after_run.sh

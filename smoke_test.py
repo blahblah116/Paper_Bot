@@ -283,6 +283,15 @@ check("t1 arXiv 상한 2", len(ax_t1) == 2)
 check("t2는 독립 카운트(2편 전부)", len(s2_t2) == 2)
 check("최신순(입력 순서) 유지", [p.uid for p in s2_t1] == [f"q:t1:semantic_scholar:{i}" for i in range(3)])
 check("0 = 무제한", len(apply_quota(mix, QuotaConfig(0, 0))) == len(mix))
+from paperbot.config import Topic
+_tq = {"t1": Topic(name="t1", interest="x", quota_s2=1, quota_arxiv=3)}   # t1만 오버라이드
+out2 = apply_quota(mix, q, _tq)
+check("topic 오버라이드: t1 S2 1", len([p for p in out2 if p.topic_name == "t1" and p.source == "semantic_scholar"]) == 1)
+check("topic 오버라이드: t1 arXiv 3", len([p for p in out2 if p.topic_name == "t1" and p.source == "arxiv"]) == 3)
+check("오버라이드 없는 t2는 전역 quota", len([p for p in out2 if p.topic_name == "t2"]) == 2)
+check("config: self-improving-agent 오버라이드 로드",
+      (t := next((t for t in cfg.topics if t.name == "self-improving-agent"), None)) is None
+      or (t.quota_arxiv, t.quota_s2) == (3, 1))
 
 print("== filter: judge JSON 파싱 ==")
 check("정상", _parse_judge_json('{"score": 8, "reason": "관련"}') == (8.0, "관련"))
