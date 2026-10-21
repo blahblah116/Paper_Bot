@@ -32,7 +32,10 @@ def esc(s: str) -> str:
 
 def format_result(r: SaveResult, drive: DriveUploader) -> str:
     """저장 완료 답글."""
-    coll = f"Zotero 컬렉션 `{esc(r.collection)}`" + (" (새로 만듦)" if r.collection_created else "")
+    coll = f"Zotero 컬렉션 `{esc(r.collection)}`"
+    if r.collection_created:
+        made = "/".join(r.collection_created)
+        coll += " (새로 만듦)" if made == r.collection else f" (하위 `{esc(made)}` 새로 만듦)"
     if r.existed:
         coll += " — 이미 라이브러리에 있던 항목에 추가"
     if r.pdf == "uploaded":
@@ -53,6 +56,8 @@ def format_usage(collections: list[str] | None, remote: str, error: str | None =
     return ("*사용법* — 논문 스레드에서 `@zoterobot <컬렉션명>`\n"
             f"→ 원글 논문을 Zotero 컬렉션과 Drive `{esc(remote)}/<컬렉션명>/`에 저장 "
             "(컬렉션이 없으면 새로 만듦)\n"
+            "하위 컬렉션은 `ICML/2026`처럼 `/`로 → Zotero `ICML > 2026`, Drive `…/ICML/2026/` "
+            "(이름만 적으면 최상위 컬렉션)\n"
             "스레드 밖에서는 `@zoterobot <컬렉션명> <arXiv·DOI 링크>` · 질문은 DM으로\n"
             f"*현재 컬렉션*: {colls}")
 

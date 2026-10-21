@@ -23,7 +23,7 @@ from .resolver import clean_slack_text, first_ref, resolve
 from .session import RESET_WORDS, ChatLog, Conversations
 from .slackbot import SlackBot
 from .textcache import TextCache
-from .zotero import ZoteroClient, ZoteroError
+from .zotero import ZoteroClient, ZoteroError, collection_paths
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +39,7 @@ class SaveHandler:
 
     def usage(self) -> str:
         try:
-            names = sorted({c["name"] for c in self.zot.collections()}, key=str.lower)
+            names = sorted(collection_paths(self.zot.collections()).values(), key=str.lower)
             return format_usage(names, self.drive.remote)
         except ZoteroError as e:
             return format_usage(None, self.drive.remote, error=str(e))

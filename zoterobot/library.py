@@ -1,7 +1,10 @@
-"""논문 하나를 Zotero 컬렉션 + Google Drive 컬렉션 폴더에 저장 (스레드 '@zoterobot <컬렉션>').
+"""논문 하나를 Zotero 컬렉션 + Google Drive 컬렉션 폴더에 저장 (스레드 '@zoterobot <컬렉션 경로>').
+
+'ICML/2026'이면 Zotero는 ICML > 2026 하위 컬렉션, Drive는 <remote>/ICML/2026/, 링크는 attachments:ICML/2026/… —
+세 곳이 항상 같은 경로를 쓴다(Attanger {{collection}} 규칙).
 
 순서 — 어느 단계에서 실패해도 같은 명령을 다시 보내면 이어서 처리되게(idempotent):
-  1) 컬렉션 찾기/생성
+  1) 컬렉션 경로를 단계별로 찾기/생성 (없는 단계만 생성)
   2) 라이브러리에 같은 논문이 있으면 재사용(컬렉션만 추가), 없으면 메타데이터 항목 생성
   3) 항목에 PDF가 이미 있으면 끝. 없으면 PDF 다운로드 → rclone으로 Drive에 업로드 → linked_file 첨부
 """
@@ -27,7 +30,7 @@ logger = logging.getLogger(__name__)
 class SaveResult:
     title: str
     collection: str
-    collection_created: bool
+    collection_created: list[str]   # 이번에 새로 만든 컬렉션 단계 이름들 (예: ['2026']); 없으면 []
     item_key: str
     existed: bool                 # 라이브러리에 이미 있던 항목인지
     pdf: str                      # "uploaded" | "already" | "unavailable"
@@ -54,8 +57,8 @@ def save_paper(cfg: Config, zot: ZoteroClient, drive: DriveUploader,
     paper = resolved.paper
     lib = cfg.library
 
-    coll, created = zot.find_or_create_collection(collection_name)
-    coll_key, coll_name = coll["key"], coll["name"]
+    coll = zot.find_or_create_collection(collection_name)
+    coll_key, coll_name, created = coll.key, coll.path, coll.created   # coll_name = 'ICML/2026' 전체 경로
 
     data = zot.find_existing(paper)
     existed = data is not None

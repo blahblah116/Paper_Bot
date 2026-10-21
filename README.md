@@ -233,11 +233,13 @@ Config and code changes need no restart — every day is a fresh process. Changi
 
 ### 5.1 Zotero + Google Drive layout
 
-zoterobot assumes the [Attanger](https://github.com/MuiseDestiny/zotero-attanger) setup: PDFs are **linked files** inside a Google Drive folder, one sub-folder per collection, and the desktop Zotero has *Settings → Advanced → Files and Folders → Linked Attachment Base Directory* pointing at that folder. The bot writes the same structure:
+zoterobot assumes the [Attanger](https://github.com/MuiseDestiny/zotero-attanger) setup: PDFs are **linked files** inside a Google Drive folder, one sub-folder per collection (nested collections → nested folders, like Attanger's `{{collection}}`), and the desktop Zotero has *Settings → Advanced → Files and Folders → Linked Attachment Base Directory* pointing at that folder. The bot writes the same structure:
 
 ```
-<drive_remote>/<Collection>/<First author> et al. - <year> - <title>.pdf     (Zotero 7 file-name format)
-Zotero attachment path:  attachments:<Collection>/<file>.pdf                    (resolved by the desktop app)
+<drive_remote>/<Collection path>/<First author> et al. - <year> - <title>.pdf     (Zotero 7 file-name format)
+Zotero attachment path:  attachments:<Collection path>/<file>.pdf                    (resolved by the desktop app)
+
+e.g. @zoterobot ICML/2026  →  Zotero collection ICML > 2026, Drive <drive_remote>/ICML/2026/, path attachments:ICML/2026/…
 ```
 
 Linked files open in the desktop app only, not in the web library or mobile apps.
@@ -258,11 +260,12 @@ Drive access uses [rclone](https://rclone.org) (`~/.local/bin/rclone`): `rclone 
 
 ```
 @zoterobot GDL                                    save the thread's paper to the "GDL" collection (created if missing)
+@zoterobot ICML/2026                              save into sub-collection 2026 of ICML (Drive ICML/2026/); missing levels are created
 @zoterobot GDL https://arxiv.org/abs/2505.13631   save the linked paper (works outside a thread too)
 @zoterobot                                        usage + list of collections
 ```
 
-Collection names match case-insensitively; sub-collections are addressed by their own name. The bot reacts with 👀 while working and ✅ / ❌ when done, and replies with what it did. Re-sending the same command is safe: an existing item is reused and only the missing parts (collection, PDF) are added.
+Collection names match case-insensitively; sub-collections are addressed by their path (`Parent/Child`), and a bare name always means a top-level collection. The bot reacts with 👀 while working and ✅ / ❌ when done, and replies with what it did. Re-sending the same command is safe: an existing item is reused and only the missing parts (collection, PDF) are added.
 
 **Ask about your library (DM the bot):**
 

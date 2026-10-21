@@ -27,7 +27,7 @@ from paperbot.extractor import extract_text, strip_references
 
 from .drive import DriveError, DriveUploader
 from .textcache import DRIVE_TYPE, TextCache
-from .zotero import ZoteroClient
+from .zotero import ZoteroClient, collection_paths
 
 logger = logging.getLogger(__name__)
 
@@ -91,7 +91,8 @@ def _good_title(t: str) -> bool:
 
 
 def drive_meta(path: str, file_id: str | None, pdfmeta: dict | None = None) -> dict:
-    """Drive 전용 PDF 메타데이터 — 제목: PDF 메타데이터 → 파일명('저자 등 - 연도 - 제목' 형식이면 분해). 컬렉션 = 상위 폴더."""
+    """Drive 전용 PDF 메타데이터 — 제목: PDF 메타데이터 → 파일명('저자 등 - 연도 - 제목' 형식이면 분해).
+    컬렉션 = 상위 폴더 경로('ICML/2026' — Zotero 컬렉션 경로 표기와 같게)."""
     folder, _, fname = path.rpartition("/")
     stem = fname[:-4] if fname.lower().endswith(".pdf") else fname
     who, year, title = "", "", stem
@@ -104,7 +105,7 @@ def drive_meta(path: str, file_id: str | None, pdfmeta: dict | None = None) -> d
     authors = [a.strip() for a in re.split(r"[;,]| and ", pdfmeta.get("author") or "") if a.strip()] or \
         ([who] if who else [])
     return {"title": title, "authors": authors, "year": year,
-            "collections": [folder.rsplit("/", 1)[-1]] if folder else [],
+            "collections": [folder] if folder else [],
             "abstract": "", "url": f"https://drive.google.com/file/d/{file_id}/view" if file_id else "",
             "item_type": DRIVE_TYPE}
 
@@ -165,7 +166,7 @@ def _sync_zotero(cache: TextCache, zot: ZoteroClient, drive: DriveUploader | Non
     for a in atts:
         if a.get("parentItem"):
             by_parent[a["parentItem"]].append(a)
-    coll_names = {c["key"]: c["name"] for c in zot.collections()}
+    coll_names = collection_paths(zot.collections())    # 'ICML/2026' — 저장 명령·Drive 폴더와 같은 표기
     known = cache.known_zotero()
 
     stats = {"added": 0, "updated": 0, "removed": 0, "meta_only": 0, "no_text": 0}

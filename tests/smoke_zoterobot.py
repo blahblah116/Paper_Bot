@@ -25,8 +25,8 @@ from zoterobot.sync import drive_meta, sync_library
 from zoterobot.textcache import DRIVE_TYPE, TextCache, norm
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-from zoterobot.zotero import (build_item, first_creator, folder_name, has_pdf, item_matches,
-                              link_path, pdf_filename)
+from zoterobot.zotero import (Collection, ZoteroClient, build_item, collection_path, collection_paths,
+                              first_creator, folder_name, has_pdf, item_matches, link_path, pdf_filename)
 
 ok = 0
 fail = 0
@@ -116,6 +116,53 @@ check("파일명: 제목 100자 절단", len(pdf_filename(paper(title="x" * 300,
 check("링크 경로: 상대(attachments:)", link_path("attachments:", "GDL", "a.pdf") == "attachments:GDL/a.pdf")
 check("링크 경로: 절대", link_path("G:/내 드라이브/Zotero", "GDL", "a.pdf") == "G:/내 드라이브/Zotero/GDL/a.pdf")
 check("폴더명: '/'는 하위 폴더, 금지문자 제거", folder_name("Research/G:DL") == "Research/GDL")
+check("컬렉션 경로 분해", collection_path(" ICML / 2026/ ") == ["ICML", "2026"] and collection_path("GDL") == ["GDL"])
+_cols = [{"key": "A", "name": "ICML", "parentCollection": False}, {"key": "B", "name": "2026", "parentCollection": "A"},
+         {"key": "C", "name": "project", "parentCollection": False}, {"key": "D", "name": "B-rep", "parentCollection": "C"},
+         {"key": "E", "name": "CAD_agent", "parentCollection": "D"}, {"key": "F", "name": "dataset", "parentCollection": "A"}]
+check("컬렉션 전체 경로", collection_paths(_cols) == {"A": "ICML", "B": "ICML/2026", "C": "project", "D": "project/B-rep",
+                                                   "E": "project/B-rep/CAD_agent", "F": "ICML/dataset"})
+
+
+class _StubZot(ZoteroClient):
+    """네트워크 없이 find_or_create_collection 로직만 검사 — collections()/POST를 메모리로 대체."""
+
+    def __init__(self, cols):
+        super().__init__("dummy-key", "1")          # user_id가 숫자면 키 조회(네트워크) 없음
+        self.cols, self.posted, self._n = [dict(c) for c in cols], [], 0
+
+    def collections(self):
+        return [dict(c) for c in self.cols]
+
+    def _req(self, method, path, **kw):
+        assert (method, path) == ("POST", "/collections"), (method, path)
+        body = kw["json"][0]
+        self._n += 1
+        data = {"key": f"N{self._n}", "name": body["name"], "parentCollection": body["parentCollection"]}
+        self.cols.append(data)
+        self.posted.append((body["name"], body["parentCollection"]))
+
+        class R:
+            def json(self_inner):
+                return {"successful": {"0": {"key": data["key"], "data": data}}}
+        return R()
+
+
+_z = _StubZot(_cols)
+_c = _z.find_or_create_collection("icml/2026")
+check("컬렉션 경로: 기존 하위 컬렉션 매칭(대소문자 무시, 생성 없음)",
+      (_c.key, _c.path, _c.created, _z.posted) == ("B", "ICML/2026", [], []))
+_c = _z.find_or_create_collection("ICML/2027")
+check("컬렉션 경로: 없는 단계만 부모 아래 생성",
+      (_c.key, _c.path, _c.created, _z.posted) == ("N1", "ICML/2027", ["2027"], [("2027", "A")]))
+_c = _z.find_or_create_collection("New/Sub")
+check("컬렉션 경로: 두 단계 모두 생성(최상위 → 하위)",
+      (_c.path, _c.created, _z.posted[1:]) == ("New/Sub", ["New", "Sub"], [("New", False), ("Sub", "N2")]))
+_c = _z.find_or_create_collection("2026")
+check("컬렉션 경로: 이름만 적으면 최상위(하위 '2026'과 매칭 안 함)",
+      (_c.path, _c.created, _z.posted[-1]) == ("2026", ["2026"], ("2026", False)))
+_c = _z.find_or_create_collection("project/b-rep/CAD_agent")
+check("컬렉션 경로: 3단계 기존 매칭 → 실제 저장 이름으로 경로", (_c.key, _c.path, _c.created) == ("E", "project/B-rep/CAD_agent", []))
 it = build_item(paper(venue=None), pub_types=[], pub_date="2026-05-01", journal=None, collection_key="C1", tag="paperbot")
 check("항목: venue 없는 arXiv → preprint",
       it["itemType"] == "preprint" and it["archiveID"] == "arXiv:2401.12345"
@@ -154,7 +201,7 @@ class FakeZot:
 
     def find_or_create_collection(self, name):
         self.calls.append(("coll", name))
-        return ({"key": "C1", "name": "GDL"}, False) if name.lower() == "gdl" else ({"key": "C9", "name": name}, True)
+        return Collection("C1", "GDL") if name.lower() == "gdl" else Collection("C9", name, collection_path(name))
 
     def find_existing(self, p):
         return self.existing
@@ -207,6 +254,13 @@ try:
     check("저장: 결과 메시지", "Drive `gdrive:paper/GDL/" in _msg.format_result(r, d))
     r = _lib.save_paper(CFG, FakeZot(), FakeDrive(), _res, "New Coll")
     check("저장: 없는 컬렉션 → 새로 만듦", r.collection_created and "(새로 만듦)" in _msg.format_result(r, FakeDrive()))
+    r = _lib.save_paper(CFG, FakeZot(), FakeDrive(), _res, "ICML/2026")
+    check("저장: 하위 컬렉션 경로 → Drive 하위 폴더·링크 경로 동일",
+          r.collection == "ICML/2026" and r.drive_path == f"ICML/2026/{_fname}"
+          and "Drive `gdrive:paper/ICML/2026/" in _msg.format_result(r, FakeDrive()))
+    r.collection_created = ["2026"]
+    check("저장: 일부 단계만 새로 만든 메시지", "(하위 `2026` 새로 만듦)" in _msg.format_result(r, FakeDrive()))
+    check("사용법: 컬렉션 경로 표시", "`ICML/2026`" in _msg.format_usage(["ICML", "ICML/2026"], "gdrive:paper"))
     z, d = FakeZot(existing={"key": "OLD", "version": 3, "collections": []},
                    kids=[{"itemType": "attachment", "contentType": "application/pdf"}]), FakeDrive()
     r = _lib.save_paper(CFG, z, d, _res, "GDL")
@@ -445,6 +499,7 @@ m = drive_meta("WhyGNN/Xu 등 - 2019 - How Powerful are GNNs.pdf", "FID")
 check("Drive 파일명 분해(저자·연도·제목·폴더=컬렉션)",
       (m["authors"], m["year"], m["title"], m["collections"]) == (["Xu 등"], "2019", "How Powerful are GNNs", ["WhyGNN"])
       and m["url"] == "https://drive.google.com/file/d/FID/view" and m["item_type"] == DRIVE_TYPE)
+check("Drive 하위 폴더 → 컬렉션 경로", drive_meta("ICML/2026/a.pdf", "F")["collections"] == ["ICML/2026"])
 goat = "GeoAI/Kong 등 - GOAT A Global Transformer on Large-scale Graphs.pdf"
 sd = ScanDrive(
     files=[{"Path": _ud.normalize("NFD", "WhyGNN/Xu 등 - 2019 - How Powerful.pdf"), "Size": 1, "ModTime": "t", "ID": "X"},

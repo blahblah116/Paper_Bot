@@ -5,6 +5,8 @@
   path가 'attachments:GDL/x.pdf'면 데스크톱 Zotero가 '링크 첨부 파일 기본 디렉토리' 기준으로 풀어서 연다
   (Zotero 소스의 BASE_PATH_PLACEHOLDER, '/' 구분자로 기기 간 동기화).
 - 링크 파일은 그룹 라이브러리·웹·모바일에서 열리지 않으므로 개인 라이브러리 전용.
+- 컬렉션은 'ICML/2026'처럼 '/'로 하위 컬렉션을 가리킨다 (Zotero: ICML > 2026, Drive 폴더: ICML/2026/).
+  Attanger의 {{collection}}이 부모 이름을 포함한 전체 경로를 폴더로 쓰는 것과 같은 규칙.
 """
 from __future__ import annotations
 
@@ -12,6 +14,7 @@ import logging
 import re
 import time
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 import requests
@@ -29,6 +32,14 @@ _NON_VENUES = {"arxiv", "arxiv.org", "biorxiv", "medrxiv", "ssrn"}
 
 class ZoteroError(Exception):
     pass
+
+
+@dataclass
+class Collection:
+    """find_or_create_collection 결과 — key는 경로의 가장 안쪽(마지막) 컬렉션."""
+    key: str
+    path: str                                   # 실제 저장된 이름 기준 전체 경로, 예: 'ICML/2026'
+    created: list[str] = field(default_factory=list)   # 이번에 새로 만든 단계 이름들
 
 
 # ---------------------------------------------------------------- 순수 함수 (테스트 대상)
@@ -78,8 +89,25 @@ def pdf_filename(paper: Paper, lang: str = "en") -> str:
     return f"{stem or paper.uid.replace(':', '_')}.pdf"
 
 
+def collection_path(name: str) -> list[str]:
+    """'ICML/2026' → ['ICML', '2026']. '/'가 하위 컬렉션 구분자, 빈 단계는 무시."""
+    return [s.strip() for s in name.split("/") if s.strip()]
+
+
+def collection_paths(cols: list[dict]) -> dict[str, str]:
+    """컬렉션 key → 부모 이름을 포함한 전체 경로 ('ICML/2026'). 사용법 목록·본문 캐시 표시용."""
+    by_key = {c["key"]: c for c in cols}
+
+    def path(key: str) -> str:
+        c = by_key[key]
+        parent = c.get("parentCollection") or None
+        return (path(parent) + "/" if parent in by_key else "") + c["name"].strip()
+
+    return {k: path(k) for k in by_key}
+
+
 def folder_name(collection_name: str) -> str:
-    """컬렉션명 → Drive 하위 폴더명. Attanger처럼 '/'는 하위 폴더 구분자로 남긴다."""
+    """컬렉션 경로('ICML/2026') → Drive 하위 폴더 경로. Attanger처럼 '/'는 하위 폴더 구분자로 남긴다."""
     segs = [sanitize_filename(s) for s in collection_name.split("/")]
     return "/".join(s for s in segs if s)
 
@@ -225,17 +253,32 @@ class ZoteroClient:
             if not page or start >= int(resp.headers.get("Total-Results", start)):
                 return out
 
-    def find_or_create_collection(self, name: str) -> tuple[dict, bool]:
-        """이름(대소문자 무시)으로 컬렉션을 찾고, 없으면 최상위에 새로 만든다. (컬렉션 data, 새로 만들었는지)"""
-        want = name.strip().lower()
-        matches = [c for c in self.collections() if c["name"].strip().lower() == want]
-        if matches:
-            matches.sort(key=lambda c: bool(c.get("parentCollection")))   # 최상위 우선
-            return matches[0], False
-        resp = self._req("POST", "/collections", json=[{"name": name.strip(), "parentCollection": False}])
-        coll = _first_success(resp.json(), "컬렉션")
-        logger.info("Zotero 컬렉션 생성: %s (%s)", name, coll["key"])
-        return coll["data"], True
+    def find_or_create_collection(self, name: str) -> Collection:
+        """'ICML/2026' 경로를 단계별로 찾고(대소문자 무시, 같은 부모 아래에서만), 없는 단계만 새로 만든다.
+
+        이름만 적으면 최상위 컬렉션을 뜻한다 — 'dataset'은 'GraphTransformer > dataset'과 매칭되지 않고
+        최상위 'dataset'을 만든다. 하위 컬렉션은 반드시 'GraphTransformer/dataset'처럼 경로로 적는다.
+        """
+        segs = collection_path(name)
+        if not segs:
+            raise ZoteroError("컬렉션 이름이 비어 있습니다.")
+        cols = self.collections()
+        parent: str | None = None
+        names, created = [], []
+        for seg in segs:
+            want = seg.lower()
+            match = next((c for c in cols if c["name"].strip().lower() == want
+                          and (c.get("parentCollection") or None) == parent), None)
+            if match is None:
+                resp = self._req("POST", "/collections",
+                                 json=[{"name": seg, "parentCollection": parent or False}])
+                match = _first_success(resp.json(), "컬렉션")["data"]
+                cols.append(match)
+                created.append(seg)
+                logger.info("Zotero 컬렉션 생성: %s (%s, parent=%s)", "/".join(names + [seg]), match["key"], parent)
+            parent = match["key"]
+            names.append(match["name"].strip())
+        return Collection(parent, "/".join(names), created)
 
     # --- 항목 ---
     def find_existing(self, paper: Paper) -> dict | None:
