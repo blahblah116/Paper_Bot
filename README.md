@@ -18,7 +18,6 @@ Both live in this repo and share one virtualenv and one Ollama model. They are s
 3. [Setup](#3-setup)
 4. [paperbot](#4-paperbot)
 5. [zoterobot](#5-zoterobot)
-6. [Tests](#6-tests)
 7. [Operations notes](#7-operations-notes)
 
 ---
@@ -297,16 +296,6 @@ tmux new -d -s zoterobot '~/paperbot/scripts/zoterobot.sh'   # the listener; res
 ```
 
 Logs go to `logs/zoterobot.log`. The listener uses about 60 MB of RAM and no GPU until a DM arrives.
-
----
-
-## 6. Tests
-
-Both suites are offline and need no tokens, network or Ollama. All checks should pass.
-
-```bash
-```
-
 
 ---
 
