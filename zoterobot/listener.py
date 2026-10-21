@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import queue
 import threading
+import time
 from collections import deque
 
 from .agent import Agent
@@ -40,6 +41,32 @@ class Listener:
         self._seen: deque[str] = deque(maxlen=500)  # Slack 재전송 이벤트 중복 방지
         self._sync_running = threading.Lock()
         self._warned_user_event = False
+        self.draining = threading.Event()           # 종료 중: 새 요청은 거절하고 처리 중인 것만 끝낸다
+        self._in_flight = 0
+        self._in_lock = threading.Lock()
+
+    # ---------------------------------------------------------------- 종료 대기
+
+    def drain(self, timeout_s: float) -> bool:
+        """새 요청을 막고, 큐와 처리 중인 작업이 비워질 때까지 기다린다. 시간 안에 끝나면 True."""
+        self.draining.set()
+        t0 = time.time()
+        last_log = 0.0
+        while True:
+            with self._in_lock:
+                busy = self._in_flight
+            if busy == 0 and self.jobs.empty() and self.chats.empty():
+                return True
+            if time.time() - t0 >= timeout_s:
+                return False
+            if time.time() - last_log >= 30:
+                logger.info("종료 대기 중 — 처리 중 %d건, 대기열 저장 %d·DM %d (%.0fs 경과)",
+                            busy, self.jobs.qsize(), self.chats.qsize(), time.time() - t0)
+                last_log = time.time()
+            time.sleep(0.5)
+
+    def mark_interrupted(self) -> None:
+        self.chat.mark_interrupted()
 
     # ---------------------------------------------------------------- 라우팅
 
@@ -65,12 +92,18 @@ class Listener:
         if ev.get("bot_id") or ev.get("subtype") or event_id in self._seen:
             return
         is_dm = ev.get("channel_type") == "im" or str(ev.get("channel", "")).startswith("D")
-        if ev.get("type") == "message" and ev.get("channel_type") == "im":
-            self._seen.append(event_id)
-            self.chats.put(ev)
-        elif ev.get("type") == "app_mention" and not is_dm:   # DM 안의 멘션은 message.im으로 이미 받음
-            self._seen.append(event_id)
-            self.jobs.put(ev)
+        wanted = (ev.get("type") == "message" and ev.get("channel_type") == "im") or \
+                 (ev.get("type") == "app_mention" and not is_dm)   # DM 안의 멘션은 message.im으로 이미 받음
+        if not wanted:
+            return
+        self._seen.append(event_id)
+        if self.draining.is_set():
+            try:
+                self.bot.reply(ev, "🔄 봇이 재시작 중입니다 — 1분쯤 뒤에 다시 보내 주세요.", thread=not is_dm)
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        (self.chats if is_dm else self.jobs).put(ev)
 
     def _for_bot(self, auths: list[dict]) -> bool:
         """봇 자신에게 온 이벤트만 처리. authorizations에 봇이 없는 이벤트는 내용을 보지 않고 버린다."""
@@ -87,6 +120,8 @@ class Listener:
     def _work(self, q: queue.Queue, handler) -> None:
         while True:
             ev = q.get()
+            with self._in_lock:
+                self._in_flight += 1
             try:
                 handler(ev)
             except Exception as e:  # noqa: BLE001 — 한 명령 실패가 리스너를 죽이면 안 된다
@@ -95,6 +130,9 @@ class Listener:
                     self.bot.reply(ev, f"⚠️ 처리 중 오류: {esc(str(e))[:300]}", thread=ev.get("type") != "message")
                 except Exception:  # noqa: BLE001
                     pass
+            finally:
+                with self._in_lock:
+                    self._in_flight -= 1
 
     def worker(self) -> None:
         self._work(self.jobs, self.handle)

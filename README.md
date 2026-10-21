@@ -252,7 +252,7 @@ Drive access uses [rclone](https://rclone.org) (`~/.local/bin/rclone`): `rclone 
 |---|---|---|
 | top level | `allowed_users` | Slack user IDs that may use the bot. Empty = everyone is rejected; the reply shows the caller's ID |
 | `library` | `drive_remote`, `link_base`, `rclone_bin`, `tag`, `filename_lang`, `unpaywall_email` | `filename_lang: ko` gives `A 등 - 2024 - …` names like a Korean Zotero UI |
-| `chat` | `model`, `keep_alive`, `max_output_tokens`, `max_tool_steps`, `ctx_tokens`, `output_reserve_tokens`, `safety_tokens`, `history_max_tokens`, `chars_per_token`, `summary_enabled`, `paperbot_config`, `summaries_per_question`, `history_turns`, `vram_gpus`, `vram_min_mib`, `catalog_max`, `text_db`, `chatlog_dir`, `sync_interval_min`, `drive_scan` | Use the same model as paperbot so only one copy sits in VRAM. Tool text is budgeted in tokens (see *Token budget* below): `ctx_tokens` must equal the server's `OLLAMA_CONTEXT_LENGTH`. `summarize_paper` runs paperbot's summarizer (from `paperbot_config`) on the cached full text (PDF fetched from Drive only if the cache has none), at most `summaries_per_question` new summaries per question |
+| `chat` | `model`, `keep_alive`, `max_output_tokens`, `max_tool_steps`, `ctx_tokens`, `output_reserve_tokens`, `safety_tokens`, `history_max_tokens`, `chars_per_token`, `summary_enabled`, `paperbot_config`, `summaries_per_question`, `history_turns`, `vram_gpus`, `vram_min_mib`, `catalog_max`, `text_db`, `chatlog_dir`, `sync_interval_min`, `drive_scan`, `drain_timeout_s` | Use the same model as paperbot so only one copy sits in VRAM. Tool text is budgeted in tokens (see *Token budget* below): `ctx_tokens` must equal the server's `OLLAMA_CONTEXT_LENGTH`. `summarize_paper` runs paperbot's summarizer (from `paperbot_config`) on the cached full text (PDF fetched from Drive only if the cache has none), at most `summaries_per_question` new summaries per question |
 
 ### 5.3 Use
 
@@ -301,7 +301,7 @@ python -m zoterobot --ask "질문"                   # ask the agent from the te
 tmux new -d -s zoterobot '~/paperbot/scripts/zoterobot.sh'   # the listener; restarts after a crash
 ```
 
-Logs go to `logs/zoterobot.log`. The listener uses about 120 MB of RAM with an 80-paper cache (the full texts and their search-normalized copies are kept in memory) and no GPU until a DM arrives.
+A restart (SIGTERM, e.g. `pkill -f "python -m zoterobot"`) refuses new requests with a "restarting" reply, finishes the questions already being answered (up to `drain_timeout_s`, default 10 min), and only then exits; if the wait runs out, the in-flight placeholder message is replaced with an "interrupted, please ask again" note. Logs go to `logs/zoterobot.log`. The listener uses about 120 MB of RAM with an 80-paper cache (the full texts and their search-normalized copies are kept in memory) and no GPU until a DM arrives.
 
 ---
 

@@ -42,3 +42,4 @@ chat:                         # DM chat agent — qwen picks tools (search / rea
   chatlog_dir: "./data/chatlog"       # one JSONL per day / 날짜별 jsonl 대화 로그
   sync_interval_min: 10       # min minutes between Zotero change checks (on DM) / DM 시 라이브러리 변경 확인 최소 간격
   drive_scan: true            # also index PDFs that exist only in drive_remote (not in Zotero) / Drive에만 있는 PDF도 검색 대상에
+  drain_timeout_s: 600        # on SIGTERM, finish in-flight questions for up to this long before exiting / 종료 시 처리 중 질문 대기

@@ -150,7 +150,11 @@ def serve(cfg: Config, zot: ZoteroClient, drive: DriveUploader, cache: TextCache
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: stop.set())
     stop.wait()
-    logger.info("종료 신호 — 연결 닫는 중")
+    logger.info("종료 신호 — 새 요청은 거절하고 처리 중인 작업을 기다립니다 (최대 %ds)", cfg.chat.drain_timeout_s)
+    if not listener.drain(cfg.chat.drain_timeout_s):
+        logger.warning("종료 대기 %ds 초과 — 처리 중이던 질문에 중단 안내를 남기고 종료", cfg.chat.drain_timeout_s)
+        listener.mark_interrupted()
+    logger.info("연결 닫는 중")
     sm.close()
     return 0
 

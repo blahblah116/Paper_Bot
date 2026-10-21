@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from typing import Callable
 
@@ -89,6 +90,21 @@ class ChatHandler:
         self.on_question = on_question
         self.convs = Conversations(cfg.chat.history_turns)
         self.chatlog = ChatLog(cfg.resolve(cfg.chat.chatlog_dir)) if agent else None
+        self.active: dict[tuple[str, str], dict] = {}   # 처리 중인 질문의 (채널, 자리표시 ts) → 로그 — 재시작 시 중단 표시용
+        self._active_lock = threading.Lock()
+
+    def mark_interrupted(self) -> None:
+        """종료 대기 시간을 넘겨 끝내지 못한 질문의 자리표시 메시지에 중단 안내를 남긴다 (cli.serve가 부른다)."""
+        with self._active_lock:
+            items = list(self.active.items())
+        for (ch, ts), log in items:
+            try:
+                self.bot.update(ch, ts, "⚠️ 봇이 재시작되어 이 질문 처리가 중단됐습니다. 같은 질문을 다시 보내 주세요.")
+            except Exception as e:  # noqa: BLE001
+                logger.warning("중단 안내 실패: %s", e)
+            if self.chatlog:
+                self.chatlog.append({**log, "status": "interrupted"})
+            logger.warning("재시작으로 중단된 질문: %s", log.get("question", "")[:80])
 
     def handle(self, ev: dict) -> None:
         if not self.bot.allowed(ev, thread=False):
@@ -123,6 +139,15 @@ class ChatHandler:
             return
 
         ts = self.bot.reply(ev, "⏳ 생각하는 중… (모델이 내려가 있으면 15초쯤 더 걸려요)", thread=False)["ts"]
+        with self._active_lock:
+            self.active[(ch, ts)] = log
+        try:
+            self._answer_with_placeholder(ev, ch, ts, question, log)
+        finally:
+            with self._active_lock:
+                self.active.pop((ch, ts), None)
+
+    def _answer_with_placeholder(self, ev: dict, ch: str, ts: str, question: str, log: dict) -> None:
         status: list[str] = []
         last = [0.0]
 
@@ -137,7 +162,7 @@ class ChatHandler:
 
         def on_status(s: str) -> None:
             status.append(s)
-            update("\n".join(status) + "\n⏳ 정리하는 중…", force=True)
+            update("\n".join(status) + "\n🧠 답변 작성 중… (논문 전문을 읽으면 1분 안팎)", force=True)
 
         def on_partial(text: str) -> None:
             shown = md_to_mrkdwn(text)

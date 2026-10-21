@@ -54,6 +54,7 @@ class ChatConfig:
     chatlog_dir: str = "./data/chatlog"       # 대화 로그 (날짜별 jsonl)
     sync_interval_min: int = 10               # DM 시 라이브러리 변경 확인 최소 간격
     drive_scan: bool = True                   # Drive(library.drive_remote)에만 있고 Zotero에 없는 PDF도 검색 대상에
+    drain_timeout_s: int = 600                # 종료 신호 뒤 처리 중인 질문을 기다리는 최대 시간(초) — 전문 요약 2~3분 포함
 
 
 @dataclass(frozen=True)
@@ -132,6 +133,7 @@ def load_config(path: str) -> Config:
         chatlog_dir=str(chat_d.get("chatlog_dir", d.chatlog_dir)),
         sync_interval_min=int(chat_d.get("sync_interval_min", d.sync_interval_min)),
         drive_scan=bool(chat_d.get("drive_scan", d.drive_scan)),
+        drain_timeout_s=int(chat_d.get("drain_timeout_s", d.drain_timeout_s)),
     )
     if chat.max_tool_steps < 1 or chat.history_turns < 0 or chat.max_output_tokens < 256:
         raise ConfigError("chat.max_tool_steps>=1, history_turns>=0, max_output_tokens>=256 이어야 합니다.")
