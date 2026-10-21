@@ -172,8 +172,14 @@ class Agent:
                 return (f"'{args.get('paper_id')}'에 해당하는 논문을 찾지 못했습니다. "
                         "목록의 id를 쓰거나 search_papers로 먼저 찾으세요."), []
             pool, limit = self._read_limit(state)
-            text = self.cache.read(d.key, args.get("focus") or None, max_chars=limit)
-            if len(d.text) > limit:
+            focus = args.get("focus") or None
+            if len(d.text) <= limit:
+                # 전문이 예산에 들어가면 focus와 무관하게 통째로 — 발췌보다 항상 정보가 많다 (2026-10-21: 세부 질문 답이 얕았던 원인)
+                text = self.cache.read(d.key, None, max_chars=limit)
+                if focus:
+                    text = f"[본문 {len(d.text):,}자 전체 — 예산에 들어가므로 focus('{focus}')로 자르지 않고 전문을 줍니다]\n" + text
+            else:
+                text = self.cache.read(d.key, focus, max_chars=limit)
                 text = (f"[남은 컨텍스트에 맞춰 이 논문은 본문 {len(d.text):,}자 중 {limit:,}자까지만 보여줍니다"
                         + (" — 꼭 필요한 부분만 focus 키워드로 다시 읽으세요" if pool > 0 else
                            " — 예산이 바닥났으니 지금까지 읽은 내용으로 답하세요") + "]\n" + text)
@@ -192,12 +198,14 @@ class Agent:
             pool, per = self._read_limit(state, len(found))
             aspects = args.get("aspects") or None
             parts = [f"[비교 자료 {len(found)}편 — 편당 최대 {per:,}자"
-                     + (f", 비교 축: {aspects}" if aspects else ", 각 논문 앞부분(초록·서론)과 끝부분") + "]"]
+                     + (f", 비교 축: {aspects}" if aspects else ", 각 논문 앞부분(초록·서론)과 끝부분")
+                     + "; 전문이 들어가는 논문은 전문]"]
             if missing:
                 parts.append(f"(못 찾은 항목: {missing} — 비교에서 제외)")
             for i, d in enumerate(found, 1):
-                parts.append(f"=== 논문 {i}/{len(found)}: {d.title} ===\n"
-                             + self.cache.read(d.key, aspects, max_chars=per))
+                whole = len(d.text) <= per            # 예산에 들어가면 비교 축과 무관하게 전문
+                parts.append(f"=== 논문 {i}/{len(found)}: {d.title}" + (" (전문)" if whole else " (발췌)") + " ===\n"
+                             + self.cache.read(d.key, None if whole else aspects, max_chars=per))
             return "\n\n".join(parts), [d.key for d in found]
         if name == "summarize_paper":
             d = self.cache.find_by_title(str(args.get("paper_id", "")))
