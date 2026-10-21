@@ -29,6 +29,7 @@ from .zotero import ZoteroClient, ZoteroError, collection_paths
 logger = logging.getLogger(__name__)
 
 _UPDATE_EVERY = 2.5        # DM 답변 스트리밍 시 chat.update 최소 간격(초) — Slack rate limit 여유
+_FINAL_RETRY_WAITS = (1.0, 2.0)   # 최종 답 갱신 실패 시 재시도 전 대기(초) — 2026-10-21 429로 새 메시지가 또 올라간 사고
 _PREVIEW_MAX = 3800        # 실시간 갱신에 보여줄 최대 글자 수 (전체는 완료 시 최종 갱신에서)
 
 
@@ -147,6 +148,24 @@ class ChatHandler:
             with self._active_lock:
                 self.active.pop((ch, ts), None)
 
+    def _finalize(self, ev: dict, ch: str, ts: str, final: str, last_update_at: float) -> None:
+        """자리표시 메시지를 최종 답으로 교체. 직전 스트리밍 갱신과 1초 이상 띄우고, 실패하면 잠시 뒤 재시도한다.
+        끝내 안 되면 새 메시지로 보내되 자리표시에는 안내만 남겨 같은 답이 두 번 보이지 않게 한다."""
+        time.sleep(max(0.0, 1.0 - (time.time() - last_update_at)))
+        for attempt, wait in enumerate((*_FINAL_RETRY_WAITS, None)):
+            try:
+                self.bot.update(ch, ts, final)
+                return
+            except Exception as e:  # noqa: BLE001 — 429 등
+                logger.warning("최종 답 갱신 실패 (%d/%d): %s", attempt + 1, len(_FINAL_RETRY_WAITS) + 1, e)
+                if wait is not None:
+                    time.sleep(wait)
+        self.bot.reply(ev, final, thread=False)
+        try:
+            self.bot.update(ch, ts, "⬇️ 답변은 아래 메시지에 있습니다.")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("자리표시 정리 실패: %s", e)
+
     def _answer_with_placeholder(self, ev: dict, ch: str, ts: str, question: str, log: dict) -> None:
         status: list[str] = []
         last = [0.0]
@@ -182,10 +201,7 @@ class ChatHandler:
             return
         answer = res.answer or "(빈 답변 — 다시 물어봐 주세요)"
         final = md_to_mrkdwn(answer) + format_sources(self.cache, res.papers)
-        try:
-            self.bot.update(ch, ts, final[:39000])
-        except Exception:  # noqa: BLE001 — 갱신 실패 시 새 메시지로
-            self.bot.reply(ev, final[:39000], thread=False)
+        self._finalize(ev, ch, ts, final[:39000], last[0])
         self.convs.add(ch, question, answer)
         self.chatlog.append({**log, "status": "ok", "answer": answer, "tools": res.tools,
                              "papers": [{"key": k, "title": (self.cache.get(k).title if self.cache.get(k) else "")}

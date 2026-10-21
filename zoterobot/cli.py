@@ -125,6 +125,11 @@ def serve(cfg: Config, zot: ZoteroClient, drive: DriveUploader, cache: TextCache
         logger.error("ZOTEROBOT_BOT_TOKEN(xoxb-)과 ZOTEROBOT_APP_TOKEN(xapp-, Socket Mode) 환경변수가 필요합니다.")
         return 2
     web = WebClient(token=bot_token)
+    try:   # 429(Retry-After)는 SDK가 알아서 기다렸다 재시도 — 스트리밍 갱신이 몰릴 때 대비
+        from slack_sdk.http_retry.builtin_handlers import RateLimitErrorRetryHandler
+        web.retry_handlers.append(RateLimitErrorRetryHandler(max_retry_count=3))
+    except ImportError:
+        pass
     auth = web.auth_test()
     logger.info("Slack 봇 %s (%s) 인증 OK", auth.get("user"), auth.get("user_id"))
     missing = _missing_scopes(auth)
