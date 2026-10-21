@@ -101,8 +101,6 @@ run.py                       paperbot entry point (same as `python -m paperbot`)
 scripts/loop.sh              tmux runner: sleep until HH:MM, VRAM check, run paperbot, run after_run.sh
 scripts/zoterobot.sh         tmux runner for the listener (restarts it if it dies)
 scripts/after_run.example.sh optional hook that runs right after paperbot (copy to after_run.sh)
-tests/smoke_paperbot.py      offline tests (no network, no Ollama)
-tests/smoke_zoterobot.py     offline tests with fake Slack / Zotero / Drive / LLM
 config.example.yaml          paperbot settings template
 zoterobot/config.example.yaml zoterobot settings template
 ```
@@ -307,11 +305,8 @@ Logs go to `logs/zoterobot.log`. The listener uses about 60 MB of RAM and no GPU
 Both suites are offline and need no tokens, network or Ollama. All checks should pass.
 
 ```bash
-python -m tests.smoke_paperbot     # config parsing, uid rules, store, quota, extraction, Slack formatting
-python -m tests.smoke_zoterobot    # command parsing, Zotero item rules, save flow, cache sync/search, agent loop, routing
 ```
 
-`tests/smoke_paperbot.py` loads your real `config.yaml`, so a few checks describe its topics.
 
 ---
 
