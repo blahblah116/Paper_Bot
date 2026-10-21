@@ -38,6 +38,13 @@ class ChatConfig:
     temperature: float = 0.5
     max_output_tokens: int = 2048
     max_tool_steps: int = 5                   # 한 질문에 허용할 도구 호출 라운드
+    ctx_tokens: int = 65536                   # Ollama 서버 컨텍스트(OLLAMA_CONTEXT_LENGTH) — 첫 응답 뒤 /api/ps로 실제 값 확인
+    safety_tokens: int = 1024                 # 추정 오차용 여유 토큰
+    history_max_tokens: int = 6000            # 대화 기억(history_turns 쌍)이 넘으면 오래된 쌍부터 뺀다
+    chars_per_token: float = 3.5              # 영어 본문 글자/토큰 초기 추정 — 라운드마다 실측(prompt_eval_count)으로 보정
+    summary_enabled: bool = True              # summarize_paper 도구 — 캐시 본문(없으면 Drive PDF)을 paperbot 요약기로 전문 요약
+    paperbot_config: str = "../config.yaml"   # 요약기가 쓸 paperbot config.yaml (llm.max_input_chars·프롬프트·모델)
+    summaries_per_question: int = 2           # 질문 하나에서 새로 만들 전문 요약 수(편당 2~3분) — 저장된 요약은 안 셈
     history_turns: int = 4                    # DM별로 기억할 최근 질문·답 쌍 수
     vram_gpus: str = "1,2"                    # 모델이 올라갈 GPU (Ollama GGML_VK_VISIBLE_DEVICES와 같게)
     vram_min_mib: int = 13312                 # 장당 최소 여유 — 모델이 이미 올라가 있으면 체크 생략
@@ -108,6 +115,13 @@ def load_config(path: str) -> Config:
         temperature=float(chat_d.get("temperature", d.temperature)),
         max_output_tokens=int(chat_d.get("max_output_tokens", d.max_output_tokens)),
         max_tool_steps=int(chat_d.get("max_tool_steps", d.max_tool_steps)),
+        ctx_tokens=int(chat_d.get("ctx_tokens", d.ctx_tokens)),
+        safety_tokens=int(chat_d.get("safety_tokens", d.safety_tokens)),
+        history_max_tokens=int(chat_d.get("history_max_tokens", d.history_max_tokens)),
+        chars_per_token=float(chat_d.get("chars_per_token", d.chars_per_token)),
+        summary_enabled=bool(chat_d.get("summary_enabled", d.summary_enabled)),
+        paperbot_config=str(chat_d.get("paperbot_config", d.paperbot_config)),
+        summaries_per_question=int(chat_d.get("summaries_per_question", d.summaries_per_question)),
         history_turns=int(chat_d.get("history_turns", d.history_turns)),
         vram_gpus=str(chat_d.get("vram_gpus", d.vram_gpus)),
         vram_min_mib=int(chat_d.get("vram_min_mib", d.vram_min_mib)),
@@ -119,6 +133,12 @@ def load_config(path: str) -> Config:
     )
     if chat.max_tool_steps < 1 or chat.history_turns < 0 or chat.max_output_tokens < 256:
         raise ConfigError("chat.max_tool_steps>=1, history_turns>=0, max_output_tokens>=256 이어야 합니다.")
+    if chat.ctx_tokens < chat.max_output_tokens + chat.safety_tokens + 8192:
+        raise ConfigError("chat.ctx_tokens는 max_output_tokens + safety_tokens + 8192 이상이어야 합니다 (도구 결과가 들어갈 자리).")
+    if chat.history_max_tokens < 0 or not (2.0 <= chat.chars_per_token <= 6.0):
+        raise ConfigError("chat.history_max_tokens>=0, chars_per_token은 2~6 이어야 합니다.")
+    if chat.summaries_per_question < 0:
+        raise ConfigError("chat.summaries_per_question>=0 이어야 합니다.")
 
     return Config(
         allowed_users=[str(u).strip() for u in allowed if str(u).strip()],

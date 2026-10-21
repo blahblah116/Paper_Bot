@@ -36,6 +36,14 @@ CREATE TABLE IF NOT EXISTS docs (
     text_source TEXT,      -- zotero_fulltext | pdf | missing(PDF 첨부는 있으나 파일 못 받음 — 재시도) | none(PDF 없음)
     updated_at  TEXT
 );
+CREATE TABLE IF NOT EXISTS summaries (          -- summarize_paper 결과 (summary.py)
+    item_key   TEXT PRIMARY KEY,
+    summary    TEXT,
+    source     TEXT,       -- 'drive:<경로>' | 'zotero:<첨부 key>'
+    chars      INTEGER,    -- 요약기에 넣은 본문 글자 수
+    model      TEXT,
+    created_at TEXT
+);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 """
 _SNIPPET = 160               # 검색 스니펫 반경(자)
@@ -138,6 +146,22 @@ class TextCache:
     def delete(self, keys) -> None:
         for k in keys:
             self.conn.execute("DELETE FROM docs WHERE item_key=?", (k,))
+            self.conn.execute("DELETE FROM summaries WHERE item_key=?", (k,))
+        self.conn.commit()
+
+    # --- 전문 요약 (summary.py가 쓴다) ---
+    def get_summary(self, key: str) -> dict | None:
+        r = self.conn.execute("SELECT summary, source, chars, model, created_at FROM summaries WHERE item_key=?",
+                              (key.strip().upper(),)).fetchone()
+        return dict(r) if r else None
+
+    def set_summary(self, key: str, summary: str, source: str, chars: int, model: str = "") -> None:
+        self.conn.execute(
+            "INSERT INTO summaries(item_key, summary, source, chars, model, created_at) VALUES(?,?,?,?,?,?) "
+            "ON CONFLICT(item_key) DO UPDATE SET summary=excluded.summary, source=excluded.source, "
+            "chars=excluded.chars, model=excluded.model, created_at=excluded.created_at",
+            (key.strip().upper(), summary, source, int(chars), model,
+             datetime.now(timezone.utc).isoformat(timespec="seconds")))
         self.conn.commit()
 
     def known_zotero(self) -> dict[str, tuple[str, str, str]]:
@@ -177,6 +201,36 @@ class TextCache:
     def get(self, key: str) -> Doc | None:
         key = key.strip().upper()
         return next((d for d in self.docs() if d.key == key), None)
+
+    def find_by_title(self, ref: str) -> Doc | None:
+        """id 또는 제목(일부)로 문서 찾기 — 모델이 id 대신 제목을 넣었을 때. 제목 단어의 60% 이상이 맞는 최선 후보."""
+        ref = (ref or "").strip()
+        if not ref:
+            return None
+        d = self.get(ref)
+        if d:
+            return d
+        want = norm(ref)
+        exact = [d for d in self.docs() if want and want in d._t]
+        if exact:
+            return min(exact, key=lambda d: len(d._t))
+        words = [w for w in re.split(r"[^a-z0-9]+", want) if len(w) >= 3]
+        if not words:
+            return None
+        best, best_frac = None, 0.0
+        for d in self.docs():
+            frac = sum(1 for w in words if w in d._t) / len(words)
+            if frac > best_frac or (frac == best_frac and best and len(d._t) < len(best._t)):
+                best, best_frac = d, frac
+        if best_frac >= 0.6:
+            return best
+        # 'GOAT: Global-Local …'처럼 부제를 틀리게 적어도 콜론 앞 약칭(4자 이상)이 제목에 유일하게 들어 있으면 그 논문
+        short = norm(ref.split(":")[0]) if ":" in ref else ""
+        if len(short) >= 4:
+            cands = [d for d in self.docs() if re.search(r"(?<![a-z0-9])" + re.escape(short) + r"(?![a-z0-9])", d._t)]
+            if len(cands) == 1:
+                return cands[0]
+        return None
 
     def _filter(self, collection: str | None) -> list[Doc]:
         docs = self.docs()
@@ -229,14 +283,20 @@ class TextCache:
                 return ("…" if i > _SNIPPET else "") + s + "…"
         return ""
 
-    def read(self, key: str, focus: str | None = None, max_chars: int = 8000) -> str:
-        """논문 하나의 메타데이터·초록·본문(focus 키워드 주변 발췌 또는 앞부분+끝부분)."""
+    def read(self, key: str, focus: str | None = None, max_chars: int = 40000) -> str:
+        """논문 하나의 메타데이터·초록·본문(focus 키워드 주변 발췌 또는 앞부분+끝부분, 본문 max_chars자까지).
+
+        max_chars는 호출자(agent)가 config read_max_chars와 질문당 남은 총량으로 정한다.
+        """
         d = self.get(key)
         if d is None:
             return f"id '{key}'인 논문이 없습니다. search_library나 list_papers로 id를 확인하세요."
         head = (f"제목: {d.title}\n저자: {', '.join(d.authors[:8])}{' 외' if len(d.authors) > 8 else ''}\n"
                 f"연도: {d.year or '-'} · 컬렉션: {', '.join(d.collections) or '-'} · URL: {d.url or '-'}\n"
                 f"초록: {d.abstract or '(없음)'}\n\n")
+        s = self.get_summary(d.key)
+        if s:   # summarize_paper가 만든 전문 요약 — 후속 질문에 바로 쓰이게 본문 앞에
+            head += f"[전문 요약 — {(s['created_at'] or '')[:10]}, 본문 {s['chars']:,}자 기준]\n{s['summary']}\n\n"
         if not d.text:
             return head + "(본문 텍스트 없음 — 제목·초록만 있습니다)"
         text = d.text
@@ -263,6 +323,9 @@ class TextCache:
             if parts:
                 return head + f"[본문 중 '{focus}' 관련 발췌 {len(parts)}곳]\n" + "\n…\n".join(parts)
             head += f"('{focus}'는 본문에서 찾지 못해 앞부분을 보여줍니다)\n"
-        tail = 2000 if len(text) > max_chars else 0
-        body = text[: max_chars - tail] + (f"\n…(중략)…\n{text[-tail:]}" if tail else "")
-        return head + "[본문]\n" + body
+        tail = min(2000, max_chars // 4) if len(text) > max_chars else 0   # 끝부분은 상한의 1/4 이하
+        if tail:
+            omitted = len(text) - max_chars
+            body = text[: max_chars - tail] + f"\n…(중략 {omitted:,}자 — 필요하면 focus 키워드로 발췌)…\n{text[-tail:]}"
+            return head + f"[본문 — 전체 {len(text):,}자 중 앞 {max_chars - tail:,}자 + 끝 {tail:,}자]\n" + body
+        return head + "[본문]\n" + text

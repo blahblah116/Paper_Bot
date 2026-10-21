@@ -25,6 +25,7 @@ from .library import save_paper
 from .listener import Listener
 from .messages import format_result
 from .resolver import clean_slack_text, first_ref, resolve
+from .summary import PaperSummarizer
 from .sync import sync_library
 from .textcache import TextCache
 from .zotero import ZoteroClient, ZoteroError
@@ -154,6 +155,32 @@ def serve(cfg: Config, zot: ZoteroClient, drive: DriveUploader, cache: TextCache
     return 0
 
 
+def build_summarizer(cfg: Config, cache: TextCache, zot: ZoteroClient,
+                     drive: DriveUploader) -> PaperSummarizer | None:
+    """summarize_paper 도구 — paperbot config.yaml의 llm 설정으로 paperbot 요약기를 그대로 쓴다. 실패하면 None(도구 안내만)."""
+    if not cfg.chat.summary_enabled:
+        return None
+    path = cfg.resolve(cfg.chat.paperbot_config)
+    try:
+        from paperbot import summarizer as pb
+        from paperbot.config import load_config as load_paperbot_config
+        from paperbot.extractor import ExtractResult
+        pcfg = load_paperbot_config(path)
+    except Exception as e:  # noqa: BLE001 — 설정 오류·의존성 누락 모두 도구만 끈다
+        logger.error("paperbot 설정을 읽지 못해 전문 요약 도구를 끕니다 (%s): %s", path, e)
+        return None
+    if pcfg.llm.model != cfg.chat.model:
+        logger.warning("paperbot llm.model(%s) ≠ chat.model(%s) — 전문 요약 때 모델 두 개가 VRAM에 올라갑니다",
+                       pcfg.llm.model, cfg.chat.model)
+
+    def summarize_fn(paper, text):
+        return pb.summarize(pcfg, paper, ExtractResult(text=text, abstract_only=False))
+
+    logger.info("전문 요약 도구 준비: 모델 %s, 입력 상한 %d자 (%s)", pcfg.llm.model, pcfg.llm.max_input_chars, path)
+    return PaperSummarizer(cache, zot, drive, cfg.library.link_base, summarize_fn,
+                           pcfg.llm.max_input_chars, pcfg.llm.model)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
@@ -192,7 +219,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.sync:
         print(sync_library(cache, zot, drive, cfg.library.link_base, force=args.force, drive_scan=cfg.chat.drive_scan))
         return 0
-    agent = Agent(cfg.chat, cache) if cfg.chat.enabled else None
+    agent = Agent(cfg.chat, cache, build_summarizer(cfg, cache, zot, drive)) if cfg.chat.enabled else None
 
     if args.ask:
         if agent is None:
@@ -208,7 +235,8 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print("\n" + res.answer)
         print("\n[참고]", [cache.get(k).title for k in res.papers if cache.get(k)])
-        print(f"[steps={res.steps} tools={len(res.tools)} {res.duration_s:.1f}s, load {res.load_s:.1f}s]")
+        print(f"[steps={res.steps} tools={len(res.tools)} {res.duration_s:.1f}s, load {res.load_s:.1f}s, "
+              f"입력 토큰 {res.prompt_tokens} (영어 {res.ratio_en:.2f}자/토큰)]")
         return 0
 
     return serve(cfg, zot, drive, cache, agent)

@@ -166,6 +166,7 @@ class ChatHandler:
                              "papers": [{"key": k, "title": (self.cache.get(k).title if self.cache.get(k) else "")}
                                         for k in res.papers],
                              "steps": res.steps, "load_s": round(res.load_s, 1),
-                             "duration_s": round(res.duration_s, 1)})
+                             "duration_s": round(res.duration_s, 1),
+                             "prompt_tokens": res.prompt_tokens, "chars_per_token": res.ratio_en})
         logger.info("DM 답변 user=%s steps=%d tools=%d %.1fs (load %.1fs)",
                     ev.get("user"), res.steps, len(res.tools), res.duration_s, res.load_s)

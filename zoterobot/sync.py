@@ -204,6 +204,7 @@ def _sync_drive(cache: TextCache, drive: DriveUploader) -> dict:
     known = cache.known_drive()
     stats = {"added": 0, "updated": 0, "removed": 0, "files": 0}
     seen = set()
+    paths: dict[str, str] = {}          # key → Drive 상대경로 (summarize_paper가 PDF를 다시 받을 때 씀)
     for f in drive.list_pdfs():
         path = nfc(f.get("Path", ""))
         if not path or path in linked:
@@ -211,6 +212,7 @@ def _sync_drive(cache: TextCache, drive: DriveUploader) -> dict:
         stats["files"] += 1
         key = drive_key(path)
         seen.add(key)
+        paths[key] = path
         sig = f"drive|{f.get('Size')}|{f.get('ModTime')}"
         if known.get(key) == sig:
             continue
@@ -228,6 +230,7 @@ def _sync_drive(cache: TextCache, drive: DriveUploader) -> dict:
         stats["updated" if key in known else "added"] += 1
         cache.upsert(key, meta, sig, text, "pdf" if text else "missing")
         logger.info("Drive 전용 문서 %s [%d자]: %s", key, len(text), path)
+    cache.set_meta("drive_paths", json.dumps(paths, ensure_ascii=False))
     gone = set(known) - seen
     cache.delete(gone)
     stats["removed"] = len(gone)
