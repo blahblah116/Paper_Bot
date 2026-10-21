@@ -286,11 +286,11 @@ class TextCache:
     def read(self, key: str, focus: str | None = None, max_chars: int = 40000) -> str:
         """논문 하나의 메타데이터·초록·본문(focus 키워드 주변 발췌 또는 앞부분+끝부분, 본문 max_chars자까지).
 
-        max_chars는 호출자(agent)가 config read_max_chars와 질문당 남은 총량으로 정한다.
+        max_chars는 호출자(agent)가 토큰 예산(budget.py)의 남은 풀로 정한다 — 본문이 그 안에 들어가면 전문을 준다.
         """
         d = self.get(key)
         if d is None:
-            return f"id '{key}'인 논문이 없습니다. search_library나 list_papers로 id를 확인하세요."
+            return f"id '{key}'인 논문이 없습니다. search_papers나 list_papers로 id를 확인하세요."
         head = (f"제목: {d.title}\n저자: {', '.join(d.authors[:8])}{' 외' if len(d.authors) > 8 else ''}\n"
                 f"연도: {d.year or '-'} · 컬렉션: {', '.join(d.collections) or '-'} · URL: {d.url or '-'}\n"
                 f"초록: {d.abstract or '(없음)'}\n\n")

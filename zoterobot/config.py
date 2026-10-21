@@ -30,7 +30,7 @@ class LibraryConfig:
 
 @dataclass(frozen=True)
 class ChatConfig:
-    """DM 챗봇 — qwen이 도구(라이브러리 검색·논문 읽기)를 골라 쓰는 에이전트. 임베딩 모델 없음."""
+    """DM 챗봇 — qwen이 질문 유형(search·question·comparing)을 판단해 도구를 골라 쓰는 에이전트. 임베딩 모델 없음."""
     enabled: bool = True
     llm_url: str = "http://localhost:11434"   # Ollama 네이티브 API (keep_alive·think·tools 지원)
     model: str = "qwen3.8:27b"                # paperbot llm.model과 같게 — 다르면 VRAM에 두 모델이 올라간다
@@ -49,7 +49,7 @@ class ChatConfig:
     history_turns: int = 4                    # DM별로 기억할 최근 질문·답 쌍 수
     vram_gpus: str = "1,2"                    # 모델이 올라갈 GPU (Ollama GGML_VK_VISIBLE_DEVICES와 같게)
     vram_min_mib: int = 13312                 # 장당 최소 여유 — 모델이 이미 올라가 있으면 체크 생략
-    catalog_max: int = 300                    # 논문 수가 이 이하면 전체 목록을 시스템 프롬프트에 넣는다
+    catalog_max: int = 0                      # 0이면 목록을 프롬프트에 넣지 않고 항상 search_papers로 찾는다; N이면 N편 이하일 때 전체 목록 포함
     text_db: str = "./data/library_text.db"   # 라이브러리 본문 텍스트 캐시 (sqlite)
     chatlog_dir: str = "./data/chatlog"       # 대화 로그 (날짜별 jsonl)
     sync_interval_min: int = 10               # DM 시 라이브러리 변경 확인 최소 간격

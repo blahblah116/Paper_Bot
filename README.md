@@ -18,7 +18,7 @@ Both live in this repo and share one virtualenv and one Ollama model. They are s
 3. [Setup](#3-setup)
 4. [paperbot](#4-paperbot)
 5. [zoterobot](#5-zoterobot)
-7. [Operations notes](#7-operations-notes)
+6. [Operations notes](#6-operations-notes)
 
 ---
 
@@ -48,13 +48,14 @@ Slack thread: "@zoterobot GDL"          Slack DM: "which paper used Laplacian ei
   SaveHandler                              ChatHandler
   ├─ find the paper from the parent         ├─ GPU free? (else reply "busy")
   │   message's arXiv/DOI link              ├─ post "thinking…" and start a background library sync
-  ├─ look up metadata (S2 → arXiv)          ├─ Agent: qwen calls tools — search_library / read_paper / list_papers
-  ├─ find or create the Zotero collection   │   over the local full-text cache; progress is streamed into the message
+  ├─ look up metadata (S2 → arXiv)          ├─ Agent: qwen classifies the question (search / question / comparing) and calls
+  ├─ find or create the Zotero collection   │   search_papers / read_paper / compare_papers / summarize_paper / list_papers
+  │   (path = sub-collection, e.g. ICML/2026)│   over the local full-text cache; progress is streamed into the message
   ├─ download the PDF → rclone → Drive      └─ final answer + "papers used" with links; everything goes to the chat log
   └─ Zotero item + linked-file attachment
 ```
 
-The chat agent has **no embedding model**: the LLM decides which tool to call, with English keywords it derives from the (Korean) question. The full-text cache is filled from Zotero's full-text index or, for Drive-linked PDFs, by downloading and extracting the PDF.
+The chat agent has **no embedding model**: the LLM decides which tool to call, with English keywords it derives from the (Korean) question, and it answers from the text the tools return — whole papers when they fit the token budget. The full-text cache is filled from Zotero's full-text index or, for Drive-linked PDFs, by downloading and extracting the PDF.
 
 ---
 
@@ -88,10 +89,12 @@ zoterobot/                   Zotero + chat bot (always on)
 ├── zotero.py                Zotero Web API client, item JSON and file-name rules
 ├── drive.py                 rclone wrapper (upload, download, list, check)
 ├── library.py               the save flow: collection → item → PDF → Drive → linked attachment
-├── textcache.py             full-text cache (sqlite): documents, keyword search, reading
+├── textcache.py             full-text cache (sqlite): documents, keyword search, reading, title lookup, stored summaries
 ├── sync.py                  fills the cache from Zotero (and PDFs that exist only in the Drive folder)
-├── agent.py                 tool-calling loop over Ollama /api/chat
-├── prompts.py               tool definitions and the system prompt
+├── agent.py                 tool-calling loop over Ollama /api/chat, sized by the token budget
+├── budget.py                token budget: pool per question, estimate ↔ prompt_eval_count calibration, memory trimming
+├── summary.py               summarize_paper: paperbot's summarizer on the cached full text (PDF fallback), stored summaries
+├── prompts.py               tool definitions and the system prompt (three question types)
 ├── gpu.py                   free-VRAM check before loading the model
 ├── session.py               per-DM conversation memory and the JSONL chat log
 └── config.py                zoterobot/config.yaml → dataclasses
@@ -136,7 +139,7 @@ tmux new-session -d -s ollama \
 
 | Variable | Why |
 |---|---|
-| `OLLAMA_CONTEXT_LENGTH=65536` | Without it Ollama sizes the context from total VRAM and spreads the KV cache over every GPU. 64K keeps a 27b model on two 16GB GPUs (~21GB). It must match `llm.num_ctx` in config |
+| `OLLAMA_CONTEXT_LENGTH=65536` | Without it Ollama sizes the context from total VRAM and spreads the KV cache over every GPU. 64K keeps a 27b model on two 16GB GPUs (~21GB). It must match `llm.num_ctx` (paperbot) and `chat.ctx_tokens` (zoterobot) in the configs |
 | `GGML_VK_VISIBLE_DEVICES=1,2` | Pins the GPUs for the Vulkan backend (used when the NVIDIA driver is too old for the CUDA backend) |
 | `CUDA_VISIBLE_DEVICES=1,2` | Same pin for the CUDA backend |
 
@@ -267,17 +270,20 @@ Collection names match case-insensitively; sub-collections are addressed by thei
 **Ask about your library (DM the bot):**
 
 ```
-Which paper used Laplacian eigenvectors as positional encoding?
-What is in the GeoAI collection?
-How does NAGphormer turn a node into tokens?
-새 대화                                            forget the recent conversation
+graph transformer를 큰 그래프로 확장하는 논문 찾아줘          search → each hit with a 3–5 line summary
+SGFormer에서 attention이 linear라고 하는 근거가 뭐야?          question → read the paper, answer from its text with section/equation references
+NAGphormer랑 SGFormer 비교해줘                                comparing → commonalities and differences per aspect
+How Powerful are GNNs 논문 전체 요약해줘                      full six-section summary (paperbot format), stored for later questions
+GeoAI 컬렉션에 뭐 있어?                                       list a collection
+좀 더 구체적으로 설명해줄래?                                   follow-up: the paper is read again before answering
+새 대화                                                       forget the recent conversation
 ```
 
-Progress (🔎 searching → 📖 reading → answer) is streamed into one message. The answer ends with the papers it used, linked. If the GPUs do not have room for the model, the bot says so immediately instead of waiting.
+Progress (🔎 searching → 📖 reading → ⚖️ collecting comparison material → 📝/🧠 summarizing → answer) is streamed into one message. The answer ends with the papers it used, linked. If the GPUs do not have room for the model, the bot says so immediately instead of waiting. A new full-text summary takes 2–3 minutes; reading a whole paper for a detail question about a minute.
 
 ### 5.4 How the chat agent works
 
-- **Question types** (the system prompt makes the model classify first): *search* ("papers about X?") → `search_papers` → each hit with a 3–5 line summary grounded in the abstract/snippet/stored summary; *question* (about one paper) → `read_paper(focus)` → answer only from the returned body text, say so when the body does not contain it; *comparing* (several papers) → `compare_papers(aspects)` → commonalities and differences per aspect.
+- **Question types** (the system prompt makes the model classify first): *search* ("papers about X?") → `search_papers` → each hit with a 3–5 line summary grounded in the abstract/snippet/stored summary; *question* (about one paper) → `read_paper(focus)` → answer only from the returned body text, quoting numbers, tables, equations and settings with their section/table numbers, and say so when the body does not contain it; *comparing* (several papers) → `compare_papers(aspects)` → commonalities and differences per aspect. Follow-ups asking for more detail make the model read the paper again before answering; it never asks the user to check the paper themselves.
 - **Tools** (`prompts.py`): `search_papers(keywords, collection?, limit?)`, `read_paper(paper_id|title, focus?)`, `compare_papers(paper_ids|titles[], aspects?)` (splits the per-question read budget across the papers), `summarize_paper(paper_id|title, force?)`, `list_papers(collection?)`. Titles are resolved to ids by `TextCache.find_by_title`. `summarize_paper` (`summary.py`) runs paperbot's summarizer on the paper's full text from the cache (references already stripped, cut at `llm.max_input_chars`); only when the cache has no text does it download the PDF from Drive (or Zotero storage) and extract it; the result is stored in the cache (`summaries` table), reused on later questions and prepended to `read_paper` output so follow-up questions about that paper have the summary at hand. The system prompt contains the full paper list (`id | title | first author year | collections`) only when the library has at most `catalog_max` papers; the running config sets `catalog_max: 0`, so the model always finds papers through `search_papers` (or by passing a title straight to `read_paper`) rather than picking from a fixed list.
 - **Full-text cache** (`textcache.py`, `sync.py`): one row per Zotero item. Text comes from Zotero's full-text index when it exists, otherwise from the PDF (downloaded from Drive via rclone, or from Zotero storage). Only items whose version changed are re-extracted. With `drive_scan: true`, PDFs that exist in the Drive folder but not in Zotero are indexed too (marked `[Drive 전용]`), with the title taken from the PDF metadata or the file name.
 - **Sync timing**: a sync runs in a background thread when a DM arrives (at most every `sync_interval_min`) and right after a save. DMs never wait for it; they use the current cache.
@@ -295,11 +301,11 @@ python -m zoterobot --ask "질문"                   # ask the agent from the te
 tmux new -d -s zoterobot '~/paperbot/scripts/zoterobot.sh'   # the listener; restarts after a crash
 ```
 
-Logs go to `logs/zoterobot.log`. The listener uses about 60 MB of RAM and no GPU until a DM arrives.
+Logs go to `logs/zoterobot.log`. The listener uses about 120 MB of RAM with an 80-paper cache (the full texts and their search-normalized copies are kept in memory) and no GPU until a DM arrives.
 
 ---
 
-## 7. Operations notes
+## 6. Operations notes
 
 - **Shared GPU server**: `loop.sh` refuses to start the daily run when a GPU has less than 13 GB free, so it never pushes another user's job out of memory. The chat bot applies the same rule per DM.
 - **Semantic Scholar 429**: happens in bursts of a few seconds even with a key; the bot backs off 3 → 5 → 10 s and retries four times.

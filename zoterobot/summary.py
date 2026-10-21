@@ -115,7 +115,7 @@ class PaperSummarizer:
     def summarize(self, key: str, force: bool = False, on_status=None) -> SummaryResult:
         d = self.cache.get(key)
         if d is None:
-            raise SummaryError(f"id '{key}'인 논문이 없습니다 — search_library/list_papers로 id를 확인하세요")
+            raise SummaryError(f"id '{key}'인 논문이 없습니다 — search_papers/list_papers로 id를 확인하세요")
         if not force:
             old = self.cache.get_summary(d.key)
             if old:
