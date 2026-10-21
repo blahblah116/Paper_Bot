@@ -18,7 +18,14 @@ VRAM_WAIT_SEC=1800          # 재확인 간격 (30분)
 VRAM_MAX_WAIT_SEC=7200      # 최대 대기 (2시간)
 
 vram_ok() {
-    local free
+    local free model
+    # zoterobot DM 챗봇이 같은 모델을 이미 올려 둔 상태면 그대로 재사용하면 되므로 통과
+    # (그 모델이 VRAM을 차지해 여유가 기준 미만으로 보이는 것을 '부족'으로 오판하지 않게)
+    model=$(./venv/bin/python -c "from paperbot.config import load_config; print(load_config('config.yaml').llm.model)" 2>/dev/null)
+    if [ -n "$model" ] && curl -s --max-time 5 http://localhost:11434/api/ps | grep -q "\"name\":\"${model}\""; then
+        echo "[loop] Ollama에 ${model}이 이미 올라가 있음 — VRAM 체크 생략하고 재사용"
+        return 0
+    fi
     free=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits --id="$VRAM_GPUS" 2>/dev/null) || {
         echo "[loop] nvidia-smi 실패 — VRAM 체크 생략하고 실행"
         return 0

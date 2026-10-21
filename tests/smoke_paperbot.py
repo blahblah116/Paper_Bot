@@ -1,4 +1,5 @@
-"""v2 오프라인 스모크 테스트 — 네트워크/Ollama/Zulip 불필요."""
+"""paperbot offline smoke test — no network, Ollama or Slack needed.
+paperbot 오프라인 스모크 테스트 — 리포 루트에서 `python -m tests.smoke_paperbot` (전부 PASS가 정상)."""
 import io
 import os
 import sys
@@ -9,8 +10,9 @@ from paperbot.config import load_config, ConfigError
 from paperbot.models import Paper, make_uid, arxiv_base_id
 from paperbot.store import Store
 from paperbot.extractor import strip_references, truncate, _TRUNC_MARK, extract
+from paperbot.pipeline import apply_quota, process_paper
 from paperbot.publisher import (
-    format_message, _topic_for, DryRunPublisher, SlackPublisher,
+    DryRunPublisher, SlackPublisher,
     extract_one_liner, md_to_mrkdwn, format_slack_main, make_publisher,
 )
 from paperbot.prompts import build_summary_system_prompt, build_judge_user_prompt, JUDGE_SYSTEM_PROMPT, SECTIONS
@@ -49,7 +51,8 @@ check("embed_text abstract 포함", "abstract" in paper().embed_text)
 check("embed_text title만(무abstract)", paper(abstract=None).embed_text == paper().title)
 
 print("== config v2 ==")
-cfg = load_config(os.path.join(os.path.dirname(__file__), "config.yaml"))
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+cfg = load_config(os.path.join(REPO, "config.yaml"))
 check("topics 1개 이상 로드(개수는 사용자 튜닝 영역)", len(cfg.topics) >= 1)
 check("interest 로드", "Graph Transformer" in cfg.topics[0].interest)
 check("s2 venues", cfg.topics[0].s2.venues == ["ICLR", "NeurIPS", "ICML", "KDD"])
@@ -266,7 +269,6 @@ with tempfile.TemporaryDirectory() as d:
     st.close()
 
 print("== 발행 쿼터 ==")
-from run import apply_quota
 from paperbot.config import QuotaConfig
 check("quota 로드(값은 사용자 튜닝 영역)", cfg.quota.s2_per_topic >= 0 and cfg.quota.arxiv_per_topic >= 0)
 def mkq(i, src, topic="t1"):
@@ -291,7 +293,7 @@ check("topic 오버라이드: t1 arXiv 3", len([p for p in out2 if p.topic_name 
 check("오버라이드 없는 t2는 전역 quota", len([p for p in out2 if p.topic_name == "t2"]) == 2)
 check("config: self-improving-agent 오버라이드 로드",
       (t := next((t for t in cfg.topics if t.name == "self-improving-agent"), None)) is None
-      or (t.quota_arxiv, t.quota_s2) == (3, 1))
+      or (isinstance(t.quota_arxiv, int) and isinstance(t.quota_s2, int)))
 
 print("== filter: judge JSON 파싱 ==")
 check("정상", _parse_judge_json('{"score": 8, "reason": "관련"}') == (8.0, "관련"))
@@ -309,10 +311,10 @@ no_pdf = paper(pdf_url=None, arxiv_id=None, doi=None, uid="s2:nopdf")
 r = extract(cfg, no_pdf)
 check("PDF 후보 없음 → abstract 폴백", r.abstract_only is True and r.text == no_pdf.abstract)
 # 구조 체인 게이팅: doi 없으면 Unpaywall/제목검색 후보가 생성되지 않아야 함 (네트워크 0회)
-from paperbot.extractor import _iter_candidate_urls, _norm_title
-check("doi 없음 → 조회형 후보 없음", list(_iter_candidate_urls(cfg, no_pdf)) == [])
+from paperbot.extractor import iter_candidate_urls, _norm_title
+check("doi 없음 → 조회형 후보 없음", list(iter_candidate_urls(no_pdf, cfg.fetch.unpaywall_email)) == [])
 direct = paper(uid="arxiv:1", pdf_url="http://x/pdf", arxiv_id="2401.00001", doi=None)
-check("직접 후보 순서(pdf→arXiv)", list(_iter_candidate_urls(cfg, direct))
+check("직접 후보 순서(pdf→arXiv)", list(iter_candidate_urls(direct, cfg.fetch.unpaywall_email))
       == ["http://x/pdf", "https://arxiv.org/pdf/2401.00001"])
 check("제목 정규화 매칭", _norm_title("Multi-Agent CAD: Code-Generation!") == _norm_title("multi agent cad code generation"))
 
@@ -343,7 +345,6 @@ with tempfile.TemporaryDirectory() as d:
     check("figure 없음 → 1페이지 렌더 폴백", len(figs2) == 1)
 
 print("== 재료 없음(본문·abstract 모두 실패) 가드 ==")
-from run import process_paper
 with tempfile.TemporaryDirectory() as d:
     st2 = Store(os.path.join(d, "g.db"))
     empty = paper(uid="s2:empty", abstract=None, pdf_url=None, arxiv_id=None)
@@ -355,19 +356,18 @@ with tempfile.TemporaryDirectory() as d:
     check("failed 기록(1회 재시도 여지)", st2.should_process(empty.uid) is True)
     st2.close()
 
-print("== publisher v2 포맷 ==")
+print("== publisher: 메타 줄 ==")
 pp = paper()
-msg = format_message(pp, "### 요약", abstract_only=False)
+msg = format_slack_main(pp, "### 요약", abstract_only=False)
 check("venue+year", "ICLR 2026" in msg)
 check("인용 수", "인용 42" in msg)
 check("topic 태그", "`#graph-transformer`" in msg)
 check("url", "📄 https://arxiv.org/abs/2401.12345" in msg)
 pre = paper(venue=None, citation_count=None)
-msg2 = format_message(pre, "요약", abstract_only=True)
+msg2 = format_slack_main(pre, "요약", abstract_only=True)
 check("프리프린트 표기", "arXiv preprint 2026" in msg2)
 check("인용 없으면 생략", "인용" not in msg2)
 check("abstract 표기", "abstract 기반 요약" in msg2)
-check("topic 60자 절단", len(_topic_for(pp)) <= 60)
 buf = io.StringIO()
 with redirect_stdout(buf):
     DryRunPublisher().publish(pp, "요약본문")
@@ -389,7 +389,7 @@ check("slack 메인: 전체 요약 미포함", "### 2" not in main_msg and "문�
 # dry-run slack 레이아웃
 buf2 = io.StringIO()
 with redirect_stdout(buf2):
-    DryRunPublisher(backend="slack").publish(pp, summary_md)
+    DryRunPublisher().publish(pp, summary_md)
 out2 = buf2.getvalue()
 check("dry-run slack: 메인+스레드 구분", "채널 메인 메시지" in out2 and "스레드 댓글" in out2)
 # 토큰 없이 SlackPublisher 생성 → 설정 오류(실행 중단용 예외)
@@ -406,9 +406,9 @@ from paperbot.summarizer import unload_model
 dead_cfg = _rp(cfg, llm=_rp(cfg.llm, base_url="http://localhost:59999/v1"))
 check("unload_model 서버 없음 → False(무해)", unload_model(dead_cfg) is False)
 # make_publisher 디스패치 (dry_run 우선)
-check("make_publisher dry-run backend 반영",
+check("make_publisher dry-run → DryRunPublisher(기본 채널 반영)",
       isinstance(make_publisher(cfg, force_dry_run=True), DryRunPublisher)
-      and make_publisher(cfg, force_dry_run=True).backend == cfg.publisher.backend)
+      and make_publisher(cfg, force_dry_run=True).default_channel == cfg.slack.channel)
 
 print("== prompts ==")
 sysp = build_summary_system_prompt("ko")

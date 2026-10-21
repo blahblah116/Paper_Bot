@@ -1,0 +1,36 @@
+# zoterobot example config. Copy it to zoterobot/config.yaml (gitignored).
+# zoterobot 설정 예시 — zoterobot/config.yaml로 복사해 사용 (config.yaml은 gitignore).
+#
+# Credentials come from ~/.paperbot_env: ZOTEROBOT_BOT_TOKEN (xoxb-), ZOTEROBOT_APP_TOKEN (xapp-) — both from the
+# zoterobot Slack app — plus ZOTERO_API_KEY and optionally ZOTERO_USER_ID. If ZOTEROBOT_* are missing, SLACK_* are used.
+# 인증은 ~/.paperbot_env 환경변수: ZOTEROBOT_BOT_TOKEN(xoxb-), ZOTEROBOT_APP_TOKEN(xapp-) — 둘 다 zoterobot Slack 앱의 것,
+#   ZOTERO_API_KEY, ZOTERO_USER_ID(선택). ZOTEROBOT_*가 없으면 SLACK_*를 쓴다.
+
+allowed_users: []             # Slack user IDs allowed to use the bot (e.g. "U01ABCDEF"). Empty = reject everyone;
+                              # the rejection reply shows the caller's ID. / 허용 사용자 ID. 비면 전부 거절(거절 답글에 ID 표시)
+
+library:                      # thread command '@zoterobot <collection>' → Zotero + Google Drive / 스레드 저장 명령
+  drive_remote: "gdrive:Zotero"   # rclone "remote:path" = Attanger's file storage folder / Attanger 저장 폴더의 rclone 경로
+  link_base: "attachments:"   # Zotero linked-file path prefix (relative to its "Linked Attachment Base Directory") / 링크 첨부 경로 접두어
+  rclone_bin: "~/.local/bin/rclone"   # absolute path — tmux/cron have a short PATH / 절대 경로 (tmux·cron은 PATH가 짧다)
+  tag: "paperbot"             # tag added to each Zotero item (empty = none) / Zotero 항목 태그 (비우면 생략)
+  filename_lang: "en"         # PDF file name joiners to match your Zotero UI language: "en" (A and B / A et al.) | "ko" (A 및 B / A 등)
+                              # 파일명 접속어 — Zotero UI 언어에 맞춤
+  unpaywall_email: ""         # Unpaywall lookup email for PDFs the publisher blocks (empty = off) / Unpaywall 조회용 이메일
+
+chat:                         # DM chat agent — qwen picks tools (search / read / list); no embedding model / DM 챗봇
+  enabled: true
+  llm_url: "http://localhost:11434"   # Ollama native API / Ollama 네이티브 API
+  model: "qwen3.8:27b"        # same as paperbot's llm.model, or two models will sit in VRAM / paperbot과 같은 모델로
+  keep_alive: "10m"           # keep the model loaded this long after the last DM / 마지막 DM 후 모델 유지 시간
+  temperature: 0.5
+  max_output_tokens: 8192     # answer length cap (at ~22 tok/s a full answer takes ~6 min) / 답변 길이 상한
+  max_tool_steps: 5           # tool-call rounds per question / 질문당 도구 호출 라운드 상한
+  history_turns: 4            # Q/A pairs remembered per DM; "새 대화" resets / DM별 기억할 질문·답 쌍 ('새 대화'로 초기화)
+  vram_gpus: "1,2"            # GPUs the model loads on; below vram_min_mib free → "busy" reply / 모델이 올라갈 GPU
+  vram_min_mib: 13312         # 13 GB per GPU / 장당 최소 여유 VRAM
+  catalog_max: 300            # put the full paper list in the prompt up to this many papers / 이 수 이하면 전체 목록을 프롬프트에
+  text_db: "./data/library_text.db"   # full-text cache (sqlite); relative to this file / 본문 캐시 (이 파일 기준 상대경로)
+  chatlog_dir: "./data/chatlog"       # one JSONL per day / 날짜별 jsonl 대화 로그
+  sync_interval_min: 10       # min minutes between Zotero change checks (on DM) / DM 시 라이브러리 변경 확인 최소 간격
+  drive_scan: true            # also index PDFs that exist only in drive_remote (not in Zotero) / Drive에만 있는 PDF도 검색 대상에

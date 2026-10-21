@@ -1,10 +1,9 @@
-"""발행(Publisher).
+"""Slack publishing: channel message + thread summary (+ figure attachments).
+Slack 발행 — 채널 메인 메시지(제목·메타·링크·한 줄 요약) + 스레드 댓글(전체 요약) + figure 첨부.
 
-추상 Publisher를 기준으로 세 구현을 제공한다:
-- ZulipPublisher: 스트림에 논문당 topic 하나, 전체 요약 한 메시지
-- SlackPublisher: 채널에 메인 메시지(제목·메타·링크·한 줄 요약) + 스레드에 전체 요약
-- DryRunPublisher: 전송 없이 stdout (backend에 맞는 레이아웃으로 미리보기)
-Notion 아카이브는 이번 범위 밖 — NotionPublisher는 인터페이스 스텁만 둔다.
+- SlackPublisher: 실제 전송. 토큰은 환경변수 SLACK_BOT_TOKEN, 채널은 config(slack.channel / topic.channel).
+- DryRunPublisher: 전송 없이 같은 레이아웃을 stdout에 출력.
+- 새 백엔드를 붙이려면 Publisher를 구현하고 make_publisher에 연결한다.
 """
 from __future__ import annotations
 
@@ -18,8 +17,6 @@ from .config import Config
 from .models import Paper
 
 logger = logging.getLogger(__name__)
-
-_TOPIC_MAX = 60
 
 
 class PublishConfigError(Exception):
@@ -45,6 +42,8 @@ _MD_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
 _MD_HEADING_RE = re.compile(r"^#{1,6}\s*(.+)$", re.MULTILINE)
 
 
+# ---------------------------------------------------------------- 메시지 포맷
+
 def _format_authors(authors: list[str]) -> str:
     if not authors:
         return "저자 미상"
@@ -53,14 +52,6 @@ def _format_authors(authors: list[str]) -> str:
     if len(authors) > 3:
         s += ", et al."
     return s
-
-
-def _topic_for(paper: Paper) -> str:
-    """Zulip topic = 논문 제목 (60자 초과 시 절단)."""
-    title = paper.title
-    if len(title) > _TOPIC_MAX:
-        return title[: _TOPIC_MAX - 1].rstrip() + "…"
-    return title
 
 
 def _format_meta(paper: Paper, abstract_only: bool) -> str:
@@ -74,23 +65,6 @@ def _format_meta(paper: Paper, abstract_only: bool) -> str:
         meta += " · _(abstract 기반 요약)_"
     return meta
 
-
-def format_message(paper: Paper, summary: str, abstract_only: bool) -> str:
-    """Zulip용 단일 메시지 형식.
-
-    **{title}**
-    {authors 앞 3명, et al.} · {venue or "arXiv preprint"} {year} · 인용 {n} · `#{topic}`
-    📄 {url}
-    """
-    return (
-        f"**{paper.title}**\n"
-        f"{_format_meta(paper, abstract_only)}\n"
-        f"📄 {paper.url}\n\n"
-        f"{summary}"
-    )
-
-
-# ---------------------------------------------------------------- Slack 헬퍼
 
 def extract_one_liner(summary: str, max_chars: int = 300) -> str:
     """요약 마크다운에서 '한 줄 요약' 섹션 본문을 추출 (실패 시 앞부분으로 폴백)."""
@@ -131,12 +105,14 @@ def format_slack_thread(summary: str) -> str:
 
 
 def _topic_channel_map(cfg: Config) -> dict[str, str]:
-    """topic name → 전용 발행 대상(채널/스트림) 매핑. channel 미지정 topic은 제외."""
+    """topic name → 전용 채널 매핑. channel 미지정 topic은 제외(slack.channel 기본값 사용)."""
     return {t.name: t.channel for t in cfg.topics if t.channel}
 
 
+# ---------------------------------------------------------------- Publisher
+
 class Publisher(abc.ABC):
-    """발행 인터페이스. 새 백엔드(Notion 등)는 이 클래스를 구현한다."""
+    """발행 인터페이스. 새 백엔드는 이 클래스를 구현한다."""
 
     @abc.abstractmethod
     def publish(self, paper: Paper, summary: str, abstract_only: bool = False,
@@ -148,11 +124,9 @@ class Publisher(abc.ABC):
 
 
 class DryRunPublisher(Publisher):
-    """전송 없이 stdout으로 출력 (개발/테스트용). backend 레이아웃대로 미리보기."""
+    """전송 없이 stdout으로 출력 (개발/테스트용). Slack 레이아웃대로 미리보기."""
 
-    def __init__(self, backend: str = "zulip", default_channel: str = "?",
-                 topic_channels: dict[str, str] | None = None):
-        self.backend = backend
+    def __init__(self, default_channel: str = "?", topic_channels: dict[str, str] | None = None):
         self.default_channel = default_channel
         self.topic_channels = topic_channels or {}
 
@@ -161,61 +135,26 @@ class DryRunPublisher(Publisher):
 
     def publish(self, paper: Paper, summary: str, abstract_only: bool = False,
                 figures: list[bytes] | None = None) -> None:
+        fig_note = ""
+        if figures:
+            sizes = ", ".join(f"{len(f)//1024}KB" for f in figures)
+            fig_note = f" (+figure {len(figures)}개 첨부 예정: {sizes})"
         print("=" * 70)
-        if self.backend == "slack":
-            fig_note = ""
-            if figures:
-                sizes = ", ".join(f"{len(f)//1024}KB" for f in figures)
-                fig_note = f" (+figure {len(figures)}개 첨부 예정: {sizes})"
-            print(f"[DRY-RUN/slack → {self._dest(paper)}] 채널 메인 메시지")
-            print("-" * 70)
-            print(format_slack_main(paper, summary, abstract_only))
-            print("-" * 70)
-            print(f"[DRY-RUN/slack → {self._dest(paper)}] 스레드 댓글{fig_note}")
-            print("-" * 70)
-            print(format_slack_thread(summary))
-        else:
-            print(f"[DRY-RUN/zulip → {self._dest(paper)}] topic={_topic_for(paper)!r}")
-            print("-" * 70)
-            print(format_message(paper, summary, abstract_only))
+        print(f"[DRY-RUN/slack → {self._dest(paper)}] 채널 메인 메시지")
+        print("-" * 70)
+        print(format_slack_main(paper, summary, abstract_only))
+        print("-" * 70)
+        print(f"[DRY-RUN/slack → {self._dest(paper)}] 스레드 댓글{fig_note}")
+        print("-" * 70)
+        print(format_slack_thread(summary))
         print("=" * 70)
-
-
-class ZulipPublisher(Publisher):
-    """Zulip 스트림에 논문당 topic 하나로 포스팅."""
-
-    def __init__(self, cfg: Config):
-        import zulip  # 지연 임포트 — dry-run 경로에선 필요 없음
-
-        config_file = cfg.resolve(cfg.zulip.config_file)
-        self.client = zulip.Client(config_file=config_file)
-        self.stream = cfg.zulip.stream
-        self.topic_channels = _topic_channel_map(cfg)  # topic.channel → 스트림 override
-
-    def publish(self, paper: Paper, summary: str, abstract_only: bool = False,
-                figures: list[bytes] | None = None) -> None:
-        # figure 첨부는 현재 Slack 전용 (Zulip은 텍스트만).
-        stream = self.topic_channels.get(paper.topic_name, self.stream)
-        topic = _topic_for(paper)
-        content = format_message(paper, summary, abstract_only)
-        result = self.client.send_message(
-            {
-                "type": "stream",
-                "to": stream,
-                "topic": topic,
-                "content": content,
-            }
-        )
-        if result.get("result") != "success":
-            raise RuntimeError(f"Zulip 전송 실패: {result.get('msg', result)}")
-        logger.info("Zulip 전송 완료: stream=%s topic=%r", stream, topic)
 
 
 class SlackPublisher(Publisher):
     """Slack 채널에 메인 메시지 + 스레드 댓글로 포스팅.
 
     - 토큰: 환경변수 SLACK_BOT_TOKEN (봇 토큰 xoxb-..., chat:write 스코프)
-    - 채널: config의 slack.channel (채널명 "#papers" 또는 채널 ID)
+    - 채널: config의 slack.channel (채널명 "#papers" 또는 채널 ID), topic.channel이 있으면 우선
     - 429(rate limit)는 Retry-After를 존중해 3회 재시도.
     """
 
@@ -350,29 +289,9 @@ class SlackPublisher(Publisher):
             logger.warning("figure 업로드 실패(텍스트만 발행): %s", e)
 
 
-class NotionPublisher(Publisher):
-    """[스텁] Notion 데이터베이스 아카이브 — 이번 범위 밖.
-
-    향후 구현 시 이 클래스에 Notion API 연동을 채워 넣고,
-    make_publisher가 반환하도록 연결하면 된다.
-    """
-
-    def __init__(self, cfg: Config):
-        self.cfg = cfg
-
-    def publish(self, paper: Paper, summary: str, abstract_only: bool = False,
-                figures: list[bytes] | None = None) -> None:
-        raise NotImplementedError("Notion 아카이브는 아직 구현되지 않았습니다.")
-
-
 def make_publisher(cfg: Config, force_dry_run: bool = False) -> Publisher:
-    """config의 publisher.backend와 dry_run에 따라 적절한 Publisher를 생성."""
-    backend = cfg.publisher.backend
-    if cfg.publisher.dry_run or force_dry_run:
-        logger.info("dry-run 모드: %s 전송 대신 stdout 출력", backend)
-        default = cfg.slack.channel if backend == "slack" else cfg.zulip.stream
-        return DryRunPublisher(backend=backend, default_channel=default,
-                               topic_channels=_topic_channel_map(cfg))
-    if backend == "slack":
-        return SlackPublisher(cfg)
-    return ZulipPublisher(cfg)
+    """config의 slack.dry_run(또는 --dry-run)에 따라 DryRun / Slack publisher를 생성."""
+    if cfg.slack.dry_run or force_dry_run:
+        logger.info("dry-run 모드: Slack 전송 대신 stdout 출력")
+        return DryRunPublisher(default_channel=cfg.slack.channel, topic_channels=_topic_channel_map(cfg))
+    return SlackPublisher(cfg)

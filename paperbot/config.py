@@ -1,4 +1,5 @@
-"""config.yaml 로드 및 검증 (v2).
+"""Load and validate config.yaml into frozen dataclasses.
+config.yaml 로드 및 검증.
 
 핵심 요구: 주제·학회·연도·인용 수 등 모든 필터를 코드 수정 없이
 config.yaml에서 조절할 수 있어야 한다. 누락/오타는 여기서 명확히 실패시킨다.
@@ -39,8 +40,7 @@ class Topic:
     interest: str                          # relevance 필터의 기준이 되는 자연어 서술
     s2: S2SourceConfig | None = None       # None이면 S2 소스 스킵
     arxiv: ArxivSourceConfig | None = None # None 또는 enabled=False면 arXiv 스킵
-    channel: str | None = None             # 이 topic 전용 발행 대상(Slack 채널/Zulip 스트림).
-                                           # None이면 backend의 기본값(slack.channel/zulip.stream) 사용.
+    channel: str | None = None             # 이 topic 전용 Slack 채널. None이면 slack.channel 사용.
     quota_s2: int | None = None            # topic별 쿼터 오버라이드. None이면 quota.s2_per_topic 사용
     quota_arxiv: int | None = None         # None이면 quota.arxiv_per_topic 사용. 0 = 무제한
 
@@ -90,22 +90,11 @@ class LLMConfig:
 
 
 @dataclass(frozen=True)
-class PublisherConfig:
-    backend: str = "zulip"       # "zulip" | "slack"
-    dry_run: bool = False        # true면 전송 대신 stdout 출력
-
-
-@dataclass(frozen=True)
-class ZulipConfig:
-    config_file: str = "./zuliprc"
-    stream: str = "papers"
-
-
-@dataclass(frozen=True)
 class SlackConfig:
     channel: str = "#papers"     # 채널명("#papers") 또는 채널 ID("C0123...")
     attach_figure: bool = False  # 대표 figure PNG를 스레드에 첨부 (files:write 스코프 필요)
     max_figures: int = 3         # 논문당 첨부할 최대 figure 수 (앞 8페이지에서 선별)
+    dry_run: bool = False        # true면 전송 대신 stdout 출력 (토큰 없이 테스트)
     # 봇 토큰은 config에 넣지 않고 환경변수 SLACK_BOT_TOKEN으로 주입한다.
 
 
@@ -123,8 +112,6 @@ class Config:
     quota: QuotaConfig
     filter: FilterConfig
     llm: LLMConfig
-    publisher: PublisherConfig
-    zulip: ZulipConfig
     slack: SlackConfig
     storage: StorageConfig
     base_dir: str = field(default=".")     # config.yaml 위치 — 상대 경로 기준점
@@ -309,30 +296,16 @@ def load_config(path: str) -> Config:
             "너무 큽니다 — 프롬프트가 조용히 잘릴 수 있습니다."
         )
 
-    # --- publisher / zulip / slack / storage ---
-    zulip_d = _as_dict(raw.get("zulip"), "zulip")
-    zulip = ZulipConfig(
-        config_file=str(zulip_d.get("config_file", "./zuliprc")),
-        stream=str(zulip_d.get("stream", "papers")),
-    )
-
+    # --- slack / storage ---
     slack_d = _as_dict(raw.get("slack"), "slack")
     slack = SlackConfig(
         channel=str(slack_d.get("channel", "#papers")),
         attach_figure=bool(slack_d.get("attach_figure", False)),
         max_figures=int(slack_d.get("max_figures", 3)),
+        dry_run=bool(slack_d.get("dry_run", False)),
     )
     if slack.max_figures < 0:
         raise ConfigError("slack.max_figures는 0 이상이어야 합니다.")
-
-    pub_d = _as_dict(raw.get("publisher"), "publisher")
-    publisher = PublisherConfig(
-        backend=str(pub_d.get("backend", "zulip")).lower(),
-        # 하위 호환: 구버전 config의 zulip.dry_run도 인정.
-        dry_run=bool(pub_d.get("dry_run", zulip_d.get("dry_run", False))),
-    )
-    if publisher.backend not in ("zulip", "slack"):
-        raise ConfigError(f"publisher.backend는 'zulip' 또는 'slack'이어야 합니다: {publisher.backend}")
 
     storage_d = _as_dict(raw.get("storage"), "storage")
     storage = StorageConfig(
@@ -343,6 +316,5 @@ def load_config(path: str) -> Config:
 
     return Config(
         topics=topics, fetch=fetch, quota=quota, filter=flt, llm=llm,
-        publisher=publisher, zulip=zulip, slack=slack,
-        storage=storage, base_dir=base_dir,
+        slack=slack, storage=storage, base_dir=base_dir,
     )
