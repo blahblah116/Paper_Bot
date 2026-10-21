@@ -27,9 +27,10 @@ chat:                         # DM chat agent — qwen picks tools (search / rea
   max_output_tokens: 8192     # answer length cap (at ~22 tok/s a full answer takes ~6 min) / 답변 길이 상한
   max_tool_steps: 5           # tool-call rounds per question / 질문당 도구 호출 라운드 상한
   ctx_tokens: 65536           # server context (= OLLAMA_CONTEXT_LENGTH); verified via /api/ps after the first reply / 서버 컨텍스트
-  safety_tokens: 1024         # slack for estimation error / 추정 오차 여유
-  history_max_tokens: 6000    # drop oldest Q/A pairs beyond this / 대화 기억 상한(토큰)
-  chars_per_token: 3.5        # initial English chars-per-token, re-calibrated from prompt_eval_count / 초기 비율, 실측 보정
+  output_reserve_tokens: 3072 # tokens kept aside for the answer when sizing tool text (cap is max_output_tokens) / 답변용 예약
+  safety_tokens: 1024         # fixed slack; unmeasured text also gets +10% / 고정 여유 (+미측정분 10%)
+  history_max_tokens: 8000    # drop oldest Q/A pairs beyond this / 대화 기억 상한(토큰)
+  chars_per_token: 3.4        # initial English chars-per-token; the calibrated value is kept in the cache meta / 초기 비율, 보정값 저장
   summary_enabled: true       # summarize_paper tool: paperbot's summarizer on the cached full text (PDF from Drive only if missing) / 캐시 본문 전문 요약
   paperbot_config: "../config.yaml"   # paperbot config used by the summarizer (llm.max_input_chars, prompts) / 요약기가 쓸 paperbot 설정
   summaries_per_question: 2   # new full-text summaries per question (2–3 min each); stored ones are free / 질문당 새 요약 수

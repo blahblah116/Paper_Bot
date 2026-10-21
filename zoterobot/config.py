@@ -39,9 +39,10 @@ class ChatConfig:
     max_output_tokens: int = 2048
     max_tool_steps: int = 5                   # 한 질문에 허용할 도구 호출 라운드
     ctx_tokens: int = 65536                   # Ollama 서버 컨텍스트(OLLAMA_CONTEXT_LENGTH) — 첫 응답 뒤 /api/ps로 실제 값 확인
-    safety_tokens: int = 1024                 # 추정 오차용 여유 토큰
-    history_max_tokens: int = 6000            # 대화 기억(history_turns 쌍)이 넘으면 오래된 쌍부터 뺀다
-    chars_per_token: float = 3.5              # 영어 본문 글자/토큰 초기 추정 — 라운드마다 실측(prompt_eval_count)으로 보정
+    output_reserve_tokens: int = 3072         # 풀 계산 때 답변용으로 떼어두는 토큰 (관측 최대 답변 ~2,400의 1.3배; 생성 상한은 max_output_tokens)
+    safety_tokens: int = 1024                 # 고정 여유 토큰 (+ 미측정 추가분 추정의 10%는 budget.py가 얹는다)
+    history_max_tokens: int = 8000            # 대화 기억(history_turns 쌍)이 넘으면 오래된 쌍부터 뺀다 (긴 비교 답변 4쌍 분량)
+    chars_per_token: float = 3.4              # 영어 본문 글자/토큰 초기값 — 실측 보정값이 캐시 meta에 저장되면 그쪽을 쓴다
     summary_enabled: bool = True              # summarize_paper 도구 — 캐시 본문(없으면 Drive PDF)을 paperbot 요약기로 전문 요약
     paperbot_config: str = "../config.yaml"   # 요약기가 쓸 paperbot config.yaml (llm.max_input_chars·프롬프트·모델)
     summaries_per_question: int = 2           # 질문 하나에서 새로 만들 전문 요약 수(편당 2~3분) — 저장된 요약은 안 셈
@@ -116,6 +117,7 @@ def load_config(path: str) -> Config:
         max_output_tokens=int(chat_d.get("max_output_tokens", d.max_output_tokens)),
         max_tool_steps=int(chat_d.get("max_tool_steps", d.max_tool_steps)),
         ctx_tokens=int(chat_d.get("ctx_tokens", d.ctx_tokens)),
+        output_reserve_tokens=int(chat_d.get("output_reserve_tokens", d.output_reserve_tokens)),
         safety_tokens=int(chat_d.get("safety_tokens", d.safety_tokens)),
         history_max_tokens=int(chat_d.get("history_max_tokens", d.history_max_tokens)),
         chars_per_token=float(chat_d.get("chars_per_token", d.chars_per_token)),
@@ -133,8 +135,8 @@ def load_config(path: str) -> Config:
     )
     if chat.max_tool_steps < 1 or chat.history_turns < 0 or chat.max_output_tokens < 256:
         raise ConfigError("chat.max_tool_steps>=1, history_turns>=0, max_output_tokens>=256 이어야 합니다.")
-    if chat.ctx_tokens < chat.max_output_tokens + chat.safety_tokens + 8192:
-        raise ConfigError("chat.ctx_tokens는 max_output_tokens + safety_tokens + 8192 이상이어야 합니다 (도구 결과가 들어갈 자리).")
+    if chat.output_reserve_tokens < 256 or chat.ctx_tokens < chat.output_reserve_tokens + chat.safety_tokens + 8192:
+        raise ConfigError("chat.output_reserve_tokens>=256, ctx_tokens >= output_reserve_tokens + safety_tokens + 8192 이어야 합니다.")
     if chat.history_max_tokens < 0 or not (2.0 <= chat.chars_per_token <= 6.0):
         raise ConfigError("chat.history_max_tokens>=0, chars_per_token은 2~6 이어야 합니다.")
     if chat.summaries_per_question < 0:

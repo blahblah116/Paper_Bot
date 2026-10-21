@@ -1,7 +1,9 @@
 """Token budget for the DM agent: how much of the server context a question may spend on tool results.
 DM 에이전트의 토큰 예산 — 질문 하나가 서버 컨텍스트 중 도구 결과에 쓸 수 있는 몫을 계산한다.
 
-- 고정 글자 상한 대신: 풀 = ctx − 출력 예약(max_output_tokens) − 안전 여유 − (지금까지의 메시지 토큰).
+- 고정 글자 상한 대신: 풀 = ctx − 출력 예약(output_reserve_tokens) − 안전 여유 − (지금까지의 메시지 토큰).
+- 측정 뒤에 붙은(아직 측정 안 된) 메시지 추정에는 uplift(10%)를 얹어 추정 오차를 흡수한다. 측정 전에는 Ollama가
+  프롬프트에 끼워 넣는 도구 정의 몫(overhead)을 더한다 — 첫 응답의 측정값이 오면 둘 다 측정값으로 대체된다.
 - 토큰은 글자 수로 추정한다: 한글은 RATIO_KO(1.7자/토큰) 고정, 그 외(영어 본문·기호)는 ratio_en.
   ratio_en은 Ollama가 돌려주는 실제 입력 토큰 수(prompt_eval_count)로 라운드마다 보정한다(EMA, 2~6 범위).
 - 측정값이 있으면 그 시점까지의 메시지는 측정 토큰을 쓰고, 그 뒤에 붙은 메시지만 추정한다.
@@ -33,9 +35,12 @@ def _message_text(m: dict) -> str:
 
 
 class TokenBudget:
-    def __init__(self, ctx: int, reserve_output: int, safety: int, ratio_en: float = 3.5):
+    def __init__(self, ctx: int, reserve_output: int, safety: int, ratio_en: float = 3.5,
+                 overhead: int = 0, uplift: float = 0.10):
         self.ctx, self.reserve_output, self.safety = int(ctx), int(reserve_output), int(safety)
         self.ratio_en = float(ratio_en)
+        self.overhead = int(overhead)        # 측정 전 고정 추가분 (도구 정의 등 렌더링 몫)
+        self.uplift = float(uplift)          # 미측정 추가 메시지 추정 가산율
         self.measured: tuple[int, int] | None = None   # (측정 시점의 메시지 수, 측정된 입력 토큰)
 
     # --- 추정 ---
@@ -53,8 +58,8 @@ class TokenBudget:
         """지금 메시지들의 입력 토큰 — 측정값이 있으면 그것 + 이후 추가분 추정."""
         if self.measured and self.measured[0] <= len(messages):
             n, tokens = self.measured
-            return tokens + self.est_messages(messages, n)
-        return self.est_messages(messages)
+            return tokens + math.ceil(self.est_messages(messages, n) * (1 + self.uplift))
+        return self.est_messages(messages) + self.overhead
 
     # --- 배분 ---
     def pool(self, messages: list[dict]) -> int:

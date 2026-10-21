@@ -10,16 +10,18 @@ DM 챗봇 에이전트 — qwen이 질문 유형(search·question·comparing)을
 - Ollama 네이티브 /api/chat 스트리밍 (tools, think=false, keep_alive). 임베딩 모델 없이 도구 호출로 근거를 찾는다.
 - 도구 라운드는 max_tool_steps까지, 마지막 라운드는 도구 없이 답하게 강제한다.
 - 입력 길이는 글자 상한이 아니라 토큰 예산(budget.py)으로 제어한다:
-  풀 = ctx − 출력 예약 − 안전 여유 − 지금까지 메시지. read_paper/compare_papers는 남은 풀만큼 본문을 받고
-  (본문이 풀에 들어가면 전문, 아니면 발췌/절단 + 안내문), 풀이 바닥나면 편당 _READ_FLOOR자만 주고 다음 라운드는
-  도구 없이 답하게 한다. 라운드마다 Ollama의 실제 입력 토큰(prompt_eval_count)으로 추정 비율을 보정하고,
-  최종 생성 토큰도 남은 컨텍스트에 맞춘다. 대화 기억은 history_max_tokens를 넘으면 오래된 쌍부터 뺀다.
+  풀 = ctx − 출력 예약(output_reserve_tokens) − 안전 여유 − 지금까지 메시지. read_paper/compare_papers는 남은 풀만큼
+  본문을 받고(본문이 풀에 들어가면 전문, 아니면 발췌/절단 + 안내문), 풀이 바닥 읽기 분량(_READ_FLOOR) 아래로 내려가면
+  다음 라운드는 도구 없이 답하게 한다. 라운드마다 Ollama의 실제 입력 토큰(prompt_eval_count)으로 추정 비율을 보정하고
+  (보정값은 캐시 meta 'chars_per_token'에 저장해 재시작 후에도 이어쓴다), 최종 생성 토큰도 남은 컨텍스트에 맞춘다.
+  대화 기억은 history_max_tokens를 넘으면 오래된 쌍부터 뺀다.
 - 답에 제목이 언급된 논문도 근거(papers)로 표시한다 — 검색 결과만 보고 답한 경우.
 """
 from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import time
 from dataclasses import dataclass, field
@@ -82,15 +84,19 @@ class Agent:
         self.cfg = cfg
         self.cache = cache
         self.summarizer = summarizer          # None이면 summarize_paper 도구는 안내만 돌려준다
-        self.ratio_en = float(cfg.chars_per_token)   # 보정된 비율은 프로세스 안에서 질문 간 이어진다
+        saved = cache.get_meta("chars_per_token", "")     # 지난 실행에서 보정된 비율 (없으면 config 초기값)
+        self.ratio_en = float(saved) if saved else float(cfg.chars_per_token)
         self._server_ctx: int | None = None   # Ollama가 실제로 올린 컨텍스트(/api/ps) — 설정과 다르면 그쪽을 쓴다
+        # Ollama가 프롬프트에 렌더링하는 도구 정의 몫 — 첫 측정 전 추정에만 쓰인다
+        self._tools_overhead = TokenBudget(1, 0, 0, self.ratio_en).est(json.dumps(TOOLS, ensure_ascii=False)) + 60
 
     # --- 예산 ---
     def ctx_tokens(self) -> int:
         return self._server_ctx or self.cfg.ctx_tokens
 
     def new_budget(self) -> TokenBudget:
-        return TokenBudget(self.ctx_tokens(), self.cfg.max_output_tokens, self.cfg.safety_tokens, self.ratio_en)
+        return TokenBudget(self.ctx_tokens(), self.cfg.output_reserve_tokens, self.cfg.safety_tokens, self.ratio_en,
+                           overhead=self._tools_overhead)
 
     def new_state(self, budget: TokenBudget | None = None, messages: list[dict] | None = None) -> dict:
         """질문 하나 동안의 한도 — 토큰 예산(메시지 누적 기준), 전문 요약 횟수."""
@@ -271,8 +277,13 @@ class Agent:
                 self._check_server_ctx()
                 budget.ctx = self.ctx_tokens()
                 if budget.calibrate(messages, measured):
-                    self.ratio_en = budget.ratio_en
                     res.prompt_tokens = measured
+                    if budget.ratio_en != self.ratio_en:
+                        self.ratio_en = budget.ratio_en
+                        try:
+                            self.cache.set_meta("chars_per_token", f"{self.ratio_en:.3f}")
+                        except Exception as e:  # noqa: BLE001 — 저장 실패는 다음 보정 때 다시
+                            logger.debug("비율 저장 실패: %s", e)
                 logger.info("라운드 %d: 입력 토큰 측정 %d (추정 %d) · 영어 %.2f자/토큰 · 남은 풀 %d",
                             step + 1, measured, est, budget.ratio_en, budget.pool(messages))
             if not (calls and use_tools):
@@ -295,7 +306,7 @@ class Agent:
                     res.papers += [i for i in ids if i not in res.papers]
                 messages.append({"role": "tool", "content": result, "tool_name": name})
                 logger.info("도구 %s %s → %d자", name, args, len(result))
-            if budget.pool(messages) <= 0:
+            if budget.pool(messages) < math.ceil(_READ_FLOOR / budget.ratio_en):   # 바닥 읽기도 못 넣으면 끝
                 overflow = True
                 logger.warning("토큰 예산 소진 (사용 추정 %d / ctx %d) — 다음 라운드는 도구 없이 답하게 함",
                                budget.used(messages), budget.ctx)
