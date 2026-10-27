@@ -1,13 +1,9 @@
 # paperbot & zoterobot
 
-Two Slack bots for a research group, running fully on a local GPU server with [Ollama](https://ollama.com) — no external LLM API.
-
 | Bot | What it does | When it runs | GPU |
 |---|---|---|---|
 | **paperbot** | Finds new papers on Semantic Scholar and arXiv, filters them by your interests, summarizes each one with a local LLM, and posts to Slack channels | Once a day (tmux runner, default 07:00) | During the run only |
 | **zoterobot** | Saves a posted paper to your Zotero library + Google Drive when you mention it in a thread, and answers DMs about your library (a tool-calling chat agent) | Always on (Socket Mode listener) | Only while answering a DM |
-
-Both live in this repo and share one virtualenv and one Ollama model. They are separate Slack apps with separate tokens.
 
 ---
 
