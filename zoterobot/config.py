@@ -1,13 +1,14 @@
 """zoterobot/config.yaml 로드·검증.
 
-paperbot(매일 요약 봇)과 설정을 분리한다. 공유하는 것은 Slack 앱·토큰(~/.paperbot_env),
-Ollama 서버·모델, NAS 데이터 폴더뿐이다.
+paperbot(매일 요약 봇)과 설정을 분리한다. 공유하는 것은 Slack 앱·토큰(~/.paperbot_env), Zulip 봇(zuliprc),
+LLM 서버(llama-swap)·모델, NAS 데이터 폴더뿐이다.
 인증은 환경변수: ZOTEROBOT_BOT_TOKEN(xoxb-), ZOTEROBOT_APP_TOKEN(xapp-) — 둘 다 zoterobot Slack 앱의 것 (없으면 SLACK_*), ZOTERO_API_KEY, ZOTERO_USER_ID(선택), S2_API_KEY(선택).
+Zulip은 환경변수 ZULIP_EMAIL/ZULIP_API_KEY/ZULIP_SITE, 없으면 zulip.config_file(zuliprc)로 인증한다.
 """
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import yaml
@@ -32,13 +33,13 @@ class LibraryConfig:
 class ChatConfig:
     """DM 챗봇 — qwen이 질문 유형(search·question·comparing)을 판단해 도구를 골라 쓰는 에이전트. 임베딩 모델 없음."""
     enabled: bool = True
-    llm_url: str = "http://localhost:11434"   # Ollama 네이티브 API (keep_alive·think·tools 지원)
-    model: str = "qwen3.8:27b"                # paperbot llm.model과 같게 — 다르면 VRAM에 두 모델이 올라간다
-    keep_alive: str = "10m"                   # 마지막 DM 이후 모델 유지 시간
+    llm_url: str = "http://localhost:8090"    # llama-swap 주소(/v1 없이) — OpenAI 호환 /v1/chat/completions(tools·스트리밍) 호출.
+                                              # 모델 유지 시간(ttl 10분)은 ~/llama-swap/config.yaml에서 정한다
+    model: str = "qwen3.8:27b"                # paperbot llm.model과 같게 = llama-swap 모델 ID — 다르면 모델을 바꿔 올리느라 매번 내렸다 올린다
     temperature: float = 0.5
     max_output_tokens: int = 2048
     max_tool_steps: int = 5                   # 한 질문에 허용할 도구 호출 라운드
-    ctx_tokens: int = 65536                   # Ollama 서버 컨텍스트(OLLAMA_CONTEXT_LENGTH) — 첫 응답 뒤 /api/ps로 실제 값 확인
+    ctx_tokens: int = 65536                   # 서버 컨텍스트(llama-server -c) — 첫 응답 뒤 llama-server /props로 실제 값 확인
     output_reserve_tokens: int = 3072         # 풀 계산 때 답변용으로 떼어두는 토큰 (관측 최대 답변 ~2,400의 1.3배; 생성 상한은 max_output_tokens)
     safety_tokens: int = 1024                 # 고정 여유 토큰 (+ 미측정 추가분 추정의 10%는 budget.py가 얹는다)
     history_max_tokens: int = 8000            # 대화 기억(history_turns 쌍)이 넘으면 오래된 쌍부터 뺀다 (긴 비교 답변 4쌍 분량)
@@ -47,7 +48,7 @@ class ChatConfig:
     paperbot_config: str = "../config.yaml"   # 요약기가 쓸 paperbot config.yaml (llm.max_input_chars·프롬프트·모델)
     summaries_per_question: int = 2           # 질문 하나에서 새로 만들 전문 요약 수(편당 2~3분) — 저장된 요약은 안 셈
     history_turns: int = 4                    # DM별로 기억할 최근 질문·답 쌍 수
-    vram_gpus: str = "1,2"                    # 모델이 올라갈 GPU (Ollama GGML_VK_VISIBLE_DEVICES와 같게)
+    vram_gpus: str = "1,2"                    # 모델이 올라갈 GPU (llama-swap config의 CUDA_VISIBLE_DEVICES와 같게)
     vram_min_mib: int = 13312                 # 장당 최소 여유 — 모델이 이미 올라가 있으면 체크 생략
     catalog_max: int = 0                      # 0이면 목록을 프롬프트에 넣지 않고 항상 search_papers로 찾는다; N이면 N편 이하일 때 전체 목록 포함
     text_db: str = "./data/library_text.db"   # 라이브러리 본문 텍스트 캐시 (sqlite)
@@ -58,10 +59,20 @@ class ChatConfig:
 
 
 @dataclass(frozen=True)
+class ZulipConfig:
+    """Zulip DM 입구 — paperbot이 쓰는 봇 계정(zuliprc)을 같이 쓴다. enabled면 Slack과 함께(또는 Slack 없이) 뜬다."""
+    enabled: bool = False
+    config_file: str = "../zuliprc"           # paperbot config의 zulip.config_file과 같은 파일 (repo 루트 기준 ../)
+    allowed_users: list[str] = field(default_factory=list)   # Zulip 사용자 이메일 또는 숫자 id. 비면 전부 거절(거절 답글에 표시)
+    update_every_s: float = 5.0               # 답변 스트리밍 갱신 최소 간격(초) — Zulip은 편집마다 이력이 남는다
+
+
+@dataclass(frozen=True)
 class Config:
     allowed_users: list[str]
     library: LibraryConfig
     chat: ChatConfig
+    zulip: ZulipConfig = field(default_factory=ZulipConfig)
     base_dir: str = "."
 
     def resolve(self, path: str) -> str:
@@ -113,7 +124,6 @@ def load_config(path: str) -> Config:
         enabled=bool(chat_d.get("enabled", d.enabled)),
         llm_url=str(chat_d.get("llm_url", d.llm_url)).rstrip("/").removesuffix("/v1"),
         model=str(chat_d.get("model", d.model)),
-        keep_alive=str(chat_d.get("keep_alive", d.keep_alive)),
         temperature=float(chat_d.get("temperature", d.temperature)),
         max_output_tokens=int(chat_d.get("max_output_tokens", d.max_output_tokens)),
         max_tool_steps=int(chat_d.get("max_tool_steps", d.max_tool_steps)),
@@ -144,8 +154,24 @@ def load_config(path: str) -> Config:
     if chat.summaries_per_question < 0:
         raise ConfigError("chat.summaries_per_question>=0 이어야 합니다.")
 
+    z_d = _as_dict(raw.get("zulip"), "zulip")
+    z_allowed = z_d.get("allowed_users") or []
+    if not isinstance(z_allowed, list):
+        raise ConfigError("zulip.allowed_users는 Zulip 이메일/사용자 id 리스트여야 합니다.")
+    zd = ZulipConfig()
+    zulip = ZulipConfig(
+        enabled=bool(z_d.get("enabled", zd.enabled)),
+        config_file=str(z_d.get("config_file", zd.config_file)).strip(),
+        allowed_users=[str(u).strip() for u in z_allowed if str(u).strip()],
+        update_every_s=float(z_d.get("update_every_s", zd.update_every_s)),
+    )
+    if zulip.enabled and not zulip.config_file:
+        raise ConfigError("zulip.enabled인데 zulip.config_file이 비어 있습니다.")
+    if zulip.update_every_s < 1.0:
+        raise ConfigError("zulip.update_every_s는 1 이상이어야 합니다.")
+
     return Config(
         allowed_users=[str(u).strip() for u in allowed if str(u).strip()],
-        library=library, chat=chat,
+        library=library, chat=chat, zulip=zulip,
         base_dir=os.path.dirname(os.path.abspath(path)),
     )

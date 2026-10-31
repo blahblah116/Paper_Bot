@@ -12,6 +12,8 @@ from typing import Any
 
 import yaml
 
+ZULIP_TOPIC_MAX = 60   # Zulip topic 이름 최대 길이(서버 제한 MAX_TOPIC_NAME_LENGTH) — zulip_topic 검증과 논문별 topic 이름 절단
+
 
 class ConfigError(Exception):
     """설정 파일이 유효하지 않을 때 발생."""
@@ -41,6 +43,9 @@ class Topic:
     s2: S2SourceConfig | None = None       # None이면 S2 소스 스킵
     arxiv: ArxivSourceConfig | None = None # None 또는 enabled=False면 arXiv 스킵
     channel: str | None = None             # 이 topic 전용 Slack 채널. None이면 slack.channel 사용.
+    platform: str = "slack"                # 이 topic의 발행처: "slack" | "zulip"
+    stream: str | None = None              # platform이 zulip일 때 보낼 스트림(예외용). None이면 zulip.stream(공용 스트림)
+    zulip_topic: str | None = None         # platform이 zulip일 때 이 주제의 논문을 전부 넣을 고정 Zulip topic. None이면 논문마다 topic(=제목)
     quota_s2: int | None = None            # topic별 쿼터 오버라이드. None이면 quota.s2_per_topic 사용
     quota_arxiv: int | None = None         # None이면 quota.arxiv_per_topic 사용. 0 = 무제한
 
@@ -80,9 +85,9 @@ class FilterConfig:
 
 @dataclass(frozen=True)
 class LLMConfig:
-    base_url: str = "http://localhost:11434/v1"
-    model: str = "qwen3.5:9b"
-    num_ctx: int = 32768                   # Ollama 기본값에 맡기지 않고 명시
+    base_url: str = "http://localhost:8090/v1"   # llama-swap (OpenAI 호환)
+    model: str = "qwen3.8:27b"            # = llama-swap 모델 ID
+    num_ctx: int = 32768                   # 서버 컨텍스트(llama-swap config의 llama-server -c)와 같게 — 첫 호출 뒤 /props로 확인
     max_input_chars: int = 30000
     max_output_tokens: int = 8192          # 요약 출력 상한 (thinking 토큰 포함 — 폭주 방지)
     temperature: float = 0.3
@@ -91,11 +96,28 @@ class LLMConfig:
 
 @dataclass(frozen=True)
 class SlackConfig:
+    """Slack 발행 — platform: "slack"(기본)인 topic이 쓴다."""
     channel: str = "#papers"     # 채널명("#papers") 또는 채널 ID("C0123...")
     attach_figure: bool = False  # 대표 figure PNG를 스레드에 첨부 (files:write 스코프 필요)
-    max_figures: int = 3         # 논문당 첨부할 최대 figure 수 (앞 8페이지에서 선별)
+    max_figures: int = 3         # 논문당 첨부할 최대 figure 수 (앞 10페이지에서 선별)
+    max_tables: int = 3          # 논문당 첨부할 최대 표 수 (캡션 포함 크롭, 2026-10-23 추가)
     dry_run: bool = False        # true면 전송 대신 stdout 출력 (토큰 없이 테스트)
     # 봇 토큰은 config에 넣지 않고 환경변수 SLACK_BOT_TOKEN으로 주입한다.
+
+
+@dataclass(frozen=True)
+class ZulipConfig:
+    """Zulip 발행 — platform: "zulip"인 topic이 하나라도 있을 때 사용.
+    인증은 환경변수 ZULIP_EMAIL/ZULIP_API_KEY/ZULIP_SITE, 없으면 zuliprc 파일(config_file)."""
+    config_file: str = "./zuliprc"   # 예비용 zuliprc — 봇 설정 페이지에서 내려받은 파일
+    stream: str = "papers"           # 기본 스트림 — topic.stream이 없을 때 사용 (봇 구독 필요)
+    attach_figure: bool = True       # 대표 figure를 같은 topic에 업로드해 첨부
+    max_figures: int = 3             # 논문당 첨부할 최대 figure 수
+    max_tables: int = 3              # 논문당 첨부할 최대 표 수 (캡션 포함 크롭, 2026-10-23 추가)
+    dry_run: bool = False            # true면 Zulip topic 전송 대신 stdout 출력
+    # [REPLAY] Zulip 되올리기(한시적, paperbot/replay.py) — 옛 논문을 다 올리면 [REPLAY] 표시된 줄을 전부 지운다.
+    replay: bool = False             # [REPLAY]
+    replay_per_run: int = 3          # [REPLAY] 실행당 topic별 되올릴 수 (편당 1~2분 GPU). 0 = 남은 것 전부 한 번에
 
 
 @dataclass(frozen=True)
@@ -103,6 +125,7 @@ class StorageConfig:
     db_path: str = "./data/papers.db"
     pdf_dir: str = "./data/pdfs"
     keep_pdfs: bool = False
+    chat_text_db: str = ""       # zoterobot 본문 캐시(library_text.db) 경로 — 비면 끔. 요약한 논문의 전문·요약을 넣어 DM 챗봇이 찾게 한다
 
 
 @dataclass(frozen=True)
@@ -114,7 +137,25 @@ class Config:
     llm: LLMConfig
     slack: SlackConfig
     storage: StorageConfig
+    zulip: ZulipConfig = field(default_factory=ZulipConfig)
     base_dir: str = field(default=".")     # config.yaml 위치 — 상대 경로 기준점
+
+    def platforms(self) -> list[str]:
+        """topic들이 쓰는 발행처 집합 (설정 순서 유지). 예: ["slack"], ["slack", "zulip"]."""
+        out: list[str] = []
+        for t in self.topics:
+            if t.platform not in out:
+                out.append(t.platform)
+        return out
+
+    def platform_for(self, topic_name: str) -> str:
+        return next((t.platform for t in self.topics if t.name == topic_name), "slack")
+
+    def figures_for(self, topic_name: str) -> tuple[bool, int, int]:
+        """topic의 발행처 기준 (figure 첨부 여부, 최대 figure 수, 최대 표 수). 모르는 topic은 Slack 설정."""
+        if self.platform_for(topic_name) == "zulip":
+            return self.zulip.attach_figure, self.zulip.max_figures, self.zulip.max_tables
+        return self.slack.attach_figure, self.slack.max_figures, self.slack.max_tables
 
     def resolve(self, path: str) -> str:
         """config 내 상대 경로를 config.yaml 기준 절대 경로로 변환."""
@@ -188,6 +229,16 @@ def _parse_topic(i: int, raw: Any) -> Topic:
     channel = t.get("channel")
     channel = str(channel).strip() if channel else None
 
+    platform = str(t.get("platform", "slack") or "slack").strip().lower()
+    if platform not in ("slack", "zulip"):
+        raise ConfigError(f"{ctx}.platform은 'slack' 또는 'zulip'이어야 합니다: {platform}")
+    stream = t.get("stream")
+    stream = str(stream).strip().lstrip("#") if stream else None
+    zulip_topic = t.get("zulip_topic")
+    zulip_topic = " ".join(str(zulip_topic).split()) if zulip_topic else None
+    if zulip_topic and len(zulip_topic) > ZULIP_TOPIC_MAX:
+        raise ConfigError(f"{ctx}.zulip_topic은 {ZULIP_TOPIC_MAX}자 이하여야 합니다 (Zulip 제한): {zulip_topic}")
+
     # topic별 쿼터 오버라이드 (선택): quota: {s2: N, arxiv: N}. 없는 키는 전역 quota를 따른다.
     quota_s2 = quota_arxiv = None
     if t.get("quota") is not None:
@@ -203,8 +254,8 @@ def _parse_topic(i: int, raw: Any) -> Topic:
             if v is not None and v < 0:
                 raise ConfigError(f"{ctx}.quota.{k}는 0(무제한) 이상이어야 합니다.")
 
-    return Topic(name=name, interest=interest, s2=s2, arxiv=arxiv, channel=channel,
-                 quota_s2=quota_s2, quota_arxiv=quota_arxiv)
+    return Topic(name=name, interest=interest, s2=s2, arxiv=arxiv, channel=channel, platform=platform,
+                 stream=stream, zulip_topic=zulip_topic, quota_s2=quota_s2, quota_arxiv=quota_arxiv)
 
 
 def load_config(path: str) -> Config:
@@ -275,8 +326,8 @@ def load_config(path: str) -> Config:
     # --- llm ---
     llm_d = _as_dict(raw.get("llm"), "llm")
     llm = LLMConfig(
-        base_url=str(llm_d.get("base_url", "http://localhost:11434/v1")),
-        model=str(llm_d.get("model", "qwen3.5:9b")),
+        base_url=str(llm_d.get("base_url", "http://localhost:8090/v1")),
+        model=str(llm_d.get("model", LLMConfig.model)),
         num_ctx=int(llm_d.get("num_ctx", 32768)),
         max_input_chars=int(llm_d.get("max_input_chars", 30000)),
         max_output_tokens=int(llm_d.get("max_output_tokens", 8192)),
@@ -302,19 +353,41 @@ def load_config(path: str) -> Config:
         channel=str(slack_d.get("channel", "#papers")),
         attach_figure=bool(slack_d.get("attach_figure", False)),
         max_figures=int(slack_d.get("max_figures", 3)),
+        max_tables=int(slack_d.get("max_tables", 3)),
         dry_run=bool(slack_d.get("dry_run", False)),
     )
-    if slack.max_figures < 0:
-        raise ConfigError("slack.max_figures는 0 이상이어야 합니다.")
+    if slack.max_figures < 0 or slack.max_tables < 0:
+        raise ConfigError("slack.max_figures / slack.max_tables는 0 이상이어야 합니다.")
+
+    zulip_d = _as_dict(raw.get("zulip"), "zulip")
+    if isinstance(zulip_d.get("replay"), dict):   # [REPLAY]
+        raise ConfigError("zulip.replay는 true/false입니다 (실행당 상한은 zulip.replay_per_run).")   # [REPLAY]
+    zulip = ZulipConfig(
+        config_file=str(zulip_d.get("config_file", "./zuliprc")),
+        stream=str(zulip_d.get("stream", "papers")).strip().lstrip("#"),
+        attach_figure=bool(zulip_d.get("attach_figure", True)),
+        max_figures=int(zulip_d.get("max_figures", 3)),
+        max_tables=int(zulip_d.get("max_tables", 3)),
+        dry_run=bool(zulip_d.get("dry_run", False)),
+        replay=bool(zulip_d.get("replay", False)),                 # [REPLAY]
+        replay_per_run=int(zulip_d.get("replay_per_run", 3)),      # [REPLAY]
+    )
+    if zulip.max_figures < 0 or zulip.max_tables < 0:
+        raise ConfigError("zulip.max_figures / zulip.max_tables는 0 이상이어야 합니다.")
+    if zulip.replay_per_run < 0:   # [REPLAY]
+        raise ConfigError("zulip.replay_per_run은 0 이상이어야 합니다.")   # [REPLAY]
+    if not zulip.stream:
+        raise ConfigError("zulip.stream이 비어 있습니다.")
 
     storage_d = _as_dict(raw.get("storage"), "storage")
     storage = StorageConfig(
         db_path=str(storage_d.get("db_path", "./data/papers.db")),
         pdf_dir=str(storage_d.get("pdf_dir", "./data/pdfs")),
         keep_pdfs=bool(storage_d.get("keep_pdfs", False)),
+        chat_text_db=str(storage_d.get("chat_text_db", "") or ""),
     )
 
     return Config(
         topics=topics, fetch=fetch, quota=quota, filter=flt, llm=llm,
-        slack=slack, storage=storage, base_dir=base_dir,
+        slack=slack, storage=storage, zulip=zulip, base_dir=base_dir,
     )

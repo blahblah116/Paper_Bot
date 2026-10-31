@@ -1,4 +1,4 @@
-"""Command line entry for paperbot (`python -m paperbot` or `run.py`): args, logging, lockfile.
+"""Command line entry for paperbot (`python -m paperbot`): args, logging, lockfile.
 paperbot 명령줄 진입점 — 인자 파싱, 로깅, 중복 실행 방지 lockfile. 파이프라인 자체는 pipeline.py.
 """
 from __future__ import annotations
@@ -11,6 +11,7 @@ from logging.handlers import RotatingFileHandler
 
 from .config import Config, ConfigError, load_config
 from .pipeline import RunOptions, run
+from .store import Store
 
 logger = logging.getLogger("paperbot")
 
@@ -18,14 +19,17 @@ _REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="paperbot — local-LLM paper summary bot for Slack")
+    p = argparse.ArgumentParser(description="paperbot — local-LLM paper summary bot for Slack and Zulip")
     p.add_argument("--config", default=os.path.join(_REPO_DIR, "config.yaml"),
                    help="config.yaml 경로 (기본: 리포 루트의 config.yaml)")
-    p.add_argument("--dry-run", action="store_true", help="Slack 전송 대신 stdout 출력")
+    p.add_argument("--dry-run", action="store_true", help="Slack·Zulip 전송 대신 stdout 출력")
     p.add_argument("--limit", type=int, default=None, help="처리할 논문 수 제한 (테스트용)")
     p.add_argument("--topic", default=None, help="특정 topic만 처리 (config의 name)")
     p.add_argument("--backfill", action="store_true", help="lookback 필터를 끄고 검색 결과 전부 처리 (첫 실행용)")
     p.add_argument("--skip-filter", action="store_true", help="relevance 필터 없이 전부 요약 (디버그용)")
+    p.add_argument("--backfill-chat", action="store_true",
+                   help="DB의 done 논문 전문(+Zulip에 있는 요약)을 챗봇 캐시(storage.chat_text_db)에 채움 — PDF 재다운로드, GPU·발행 없음. "
+                        "--limit/--topic 적용, 이미 본문이 있는 논문은 건너뜀")
     return p.parse_args(argv)
 
 
@@ -93,6 +97,17 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[설정 오류] {e}", file=sys.stderr)
         return 2
     setup_logging(cfg)
+
+    if args.backfill_chat:
+        # 아침 실행과 lock을 공유하지 않는다 — GPU·발행·papers.db 쓰기가 없어 동시에 돌아도 되고, 1시간짜리 백필이 그날 실행을 막으면 안 된다
+        from . import chatdb
+        if not cfg.storage.chat_text_db:
+            print("[설정 오류] storage.chat_text_db가 비어 있습니다.", file=sys.stderr)
+            return 2
+        with Store(cfg.resolve(cfg.storage.db_path)) as store:
+            stats = chatdb.backfill(cfg, store, limit=args.limit, topic=args.topic)
+        print(stats)
+        return 0
 
     lock = _lock_path(cfg)
     if not acquire_lock(lock):

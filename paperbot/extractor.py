@@ -19,7 +19,7 @@ from dataclasses import dataclass
 import pymupdf
 
 from .config import Config
-from .figures import extract_figures  # noqa: F401 — 외부에서 extractor.extract_figures로도 접근
+from .figures import Figure, extract_figures
 from .models import Paper
 
 logger = logging.getLogger(__name__)
@@ -32,9 +32,10 @@ _SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 @dataclass
 class ExtractResult:
-    text: str
+    text: str                                        # 요약기에 넣는 본문 (max_input_chars로 절단)
     abstract_only: bool                              # True면 PDF 확보 실패로 abstract만 사용
-    figures: list[bytes] = dataclasses.field(default_factory=list)  # 대표 figure PNG들 (Slack 첨부용)
+    figures: list[Figure] = dataclasses.field(default_factory=list)  # 대표 figure·표 크롭 (kind/label/png) — Slack/Zulip 첨부용
+    full_text: str = ""                              # 절단 전 전체 본문 (참고문헌 제거) — 챗봇 캐시(chatdb)에 저장
 
 
 def _pdf_path(cfg: Config, paper: Paper) -> str:
@@ -221,8 +222,8 @@ def _download_any(urls, dest: str) -> None:
     raise RuntimeError("모든 PDF 후보 실패") from last_err
 
 
-def extract(cfg: Config, paper: Paper) -> ExtractResult:
-    """논문 하나에 대한 추출 파이프라인. 실패해도 예외 대신 abstract fallback."""
+def extract(cfg: Config, paper: Paper, figures: bool = True) -> ExtractResult:
+    """논문 하나에 대한 추출 파이프라인. 실패해도 예외 대신 abstract fallback. figures=False면 figure 렌더링 생략(백필용)."""
     dest = _pdf_path(cfg, paper)
     try:
         if not (os.path.exists(dest) and os.path.getsize(dest) > 0):
@@ -232,15 +233,17 @@ def extract(cfg: Config, paper: Paper) -> ExtractResult:
         if not raw or not raw.strip():
             raise ValueError("추출된 텍스트가 비어 있음")
 
-        text = _normalize(strip_references(raw))
-        text = truncate(text, cfg.llm.max_input_chars)
+        full = _normalize(strip_references(raw))
+        text = truncate(full, cfg.llm.max_input_chars)
 
-        # figure는 Slack 첨부가 켜져 있을 때만 추출 (불필요한 렌더링 비용 회피).
-        figures: list[bytes] = []
-        if cfg.slack.attach_figure:
-            figures = extract_figures(dest, max_figures=cfg.slack.max_figures)
-        logger.info("추출 완료 %s: %d자, figure %d개", paper.uid, len(text), len(figures))
-        return ExtractResult(text=text, abstract_only=False, figures=figures)
+        # figure는 이 topic의 발행처(slack/zulip)에서 첨부가 켜져 있을 때만 추출 (불필요한 렌더링 비용 회피).
+        attach, max_figs, max_tabs = cfg.figures_for(paper.topic_name)
+        figs: list[Figure] = []
+        if attach and figures:
+            figs = extract_figures(dest, max_figures=max_figs, max_tables=max_tabs)
+        logger.info("추출 완료 %s: %d자(전체 %d자), figure %d·표 %d개", paper.uid, len(text), len(full),
+                    sum(1 for f in figs if f.kind != "table"), sum(1 for f in figs if f.kind == "table"))
+        return ExtractResult(text=text, abstract_only=False, figures=figs, full_text=full)
 
     except Exception as e:  # noqa: BLE001 — abstract로 폴백
         logger.error("PDF 처리 실패 %s (abstract로 폴백): %s", paper.uid, e)

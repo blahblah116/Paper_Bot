@@ -7,7 +7,7 @@
   (title-only 유사도는 체계적으로 낮게 나와 같은 threshold로 자르면 과잉 컷).
 
 2단계 — LLM judge (llm_judge: true일 때):
-  임베딩 통과분을 Ollama로 0~10 채점. JSON 파싱 실패 시 1회 재요청,
+  임베딩 통과분을 로컬 LLM(llama-swap)으로 0~10 채점. JSON 파싱 실패 시 1회 재요청,
   그래도 실패하면 보수적으로 통과(놓치는 것보다 나음).
   judge_threshold 미만이면 filtered_out으로 기록해 재채점을 방지.
 """
@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 _JSON_RE = re.compile(r"\{.*?\}", re.DOTALL)
 
-# judge 출력 스키마 — 서버(Ollama)가 이 형식을 강제하므로 파싱 실패가 구조적으로 사라진다.
+# judge 출력 스키마 — 서버(llama-server의 json_schema→grammar)가 이 형식을 강제하므로 파싱 실패가 구조적으로 사라진다.
 _JUDGE_RESPONSE_FORMAT = {
     "type": "json_schema",
     "json_schema": {

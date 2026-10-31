@@ -70,6 +70,14 @@ class Store:
             self.conn.execute("ALTER TABLE papers ADD COLUMN payload TEXT")
             logger.info("DB 마이그레이션: papers.payload 컬럼 추가 (pending 대기열용)")
 
+    def done_papers(self, topic: str) -> list[sqlite3.Row]:
+        """topic의 done 논문 전부(오래된 순) — uid·title·source·judge_score. Zulip 되올리기 입력."""
+        return self.conn.execute(
+            "SELECT uid, title, source, judge_score FROM papers WHERE status='done' AND topic=? "
+            "ORDER BY processed_at ASC",
+            (topic,),
+        ).fetchall()
+
     # --- 조회 ---
     def _status(self, uid: str) -> str | None:
         row = self.conn.execute(

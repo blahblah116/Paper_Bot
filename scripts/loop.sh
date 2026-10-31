@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# paperbot tmux 러너 — 매일 지정 시각(기본 07:00)에 한 번 실행하고,
+# paperbot tmux 러너 — 매일 지정 시각(기본 07:00)에 paperbot → articlebot을 한 번씩 실행하고,
 # 실행이 끝나면 봇 프로세스는 종료(GPU 즉시 반납), 세션은 다음 시각까지 잠든다.
 #
 # 사용:
@@ -10,6 +10,10 @@ set -u
 AT="${1:-07:00}"
 cd "$(dirname "$0")/.." || exit 1   # 리포 루트로 이동
 
+# LLM 서버: llama-swap(127.0.0.1:8090)이 요청 시 llama-server(CUDA)를 띄운다.
+LLM_URL="http://127.0.0.1:8090"
+LLAMA_SWAP_CMD='$HOME/llama-swap/llama-swap -config $HOME/llama-swap/config.yaml -listen 127.0.0.1:8090 -watch-config 2>&1 | tee -a $HOME/llama-swap/llama-swap.log'
+
 # 공용 서버 VRAM 체크 — 27b(64K ctx)가 GPU 1,2에 ~11GB씩 올라가므로, 장당 13GB 미만이면
 # 타 사용자 잡을 OOM으로 죽일 수 있다. 부족하면 30분 간격으로 최대 2시간 기다리고, 그래도 안 되면 그날은 건너뜀.
 VRAM_GPUS="1,2"
@@ -18,12 +22,16 @@ VRAM_WAIT_SEC=1800          # 재확인 간격 (30분)
 VRAM_MAX_WAIT_SEC=7200      # 최대 대기 (2시간)
 
 vram_ok() {
-    local free model
+    local free loaded
     # zoterobot DM 챗봇이 같은 모델을 이미 올려 둔 상태면 그대로 재사용하면 되므로 통과
-    # (그 모델이 VRAM을 차지해 여유가 기준 미만으로 보이는 것을 '부족'으로 오판하지 않게)
-    model=$(./venv/bin/python -c "from paperbot.config import load_config; print(load_config('config.yaml').llm.model)" 2>/dev/null)
-    if [ -n "$model" ] && curl -s --max-time 5 http://localhost:11434/api/ps | grep -q "\"name\":\"${model}\""; then
-        echo "[loop] Ollama에 ${model}이 이미 올라가 있음 — VRAM 체크 생략하고 재사용"
+    # (그 모델이 VRAM을 차지해 여유가 기준 미만으로 보이는 것을 '부족'으로 오판하지 않게). 판정은 봇과 같은 헬퍼(llmserver)로.
+    loaded=$(./venv/bin/python -c "
+from paperbot import llmserver
+from paperbot.config import load_config
+c = load_config('config.yaml')
+print(c.llm.model if llmserver.is_loaded(llmserver.origin(c.llm.base_url), c.llm.model) else '')" 2>/dev/null)
+    if [ -n "$loaded" ]; then
+        echo "[loop] llama-swap에 ${loaded}이 이미 올라가 있음 — VRAM 체크 생략하고 재사용"
         return 0
     fi
     free=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits --id="$VRAM_GPUS" 2>/dev/null) || {
@@ -67,34 +75,33 @@ while true; do
     # 토큰 등 환경변수 로드 (없으면 봇이 설정 오류로 깨끗하게 중단됨)
     [ -f "$HOME/.paperbot_env" ] && . "$HOME/.paperbot_env"
 
-    # Ollama가 죽어 있으면 자동으로 살린다 (자가 치유 — ollama 세션이 필수가 아니게 됨)
-    if ! curl -s --max-time 5 http://localhost:11434/api/version >/dev/null; then
-        echo "[loop] Ollama 무응답 — 재시작 시도"
-        tmux kill-session -t ollama 2>/dev/null
-        tmux new-session -d -s ollama \
-            'CUDA_VISIBLE_DEVICES=1,2 GGML_VK_VISIBLE_DEVICES=1,2 OLLAMA_CONTEXT_LENGTH=65536 $HOME/ollama/bin/ollama serve 2>&1 | tee -a $HOME/ollama/serve.log'
+    # llama-swap이 죽어 있으면 자동으로 살린다 (자가 치유 — llama-swap 세션이 필수가 아니게 됨)
+    if ! curl -s --max-time 5 "${LLM_URL}/health" >/dev/null; then
+        echo "[loop] llama-swap 무응답 — 재시작 시도"
+        tmux kill-session -t llama-swap 2>/dev/null
+        tmux new-session -d -s llama-swap "$LLAMA_SWAP_CMD"
         for _ in $(seq 1 30); do
-            curl -s --max-time 2 http://localhost:11434/api/version >/dev/null && break
+            curl -s --max-time 2 "${LLM_URL}/health" >/dev/null && break
             sleep 1
         done
-        if curl -s --max-time 5 http://localhost:11434/api/version >/dev/null; then
-            echo "[loop] Ollama 재시작 완료"
+        if curl -s --max-time 5 "${LLM_URL}/health" >/dev/null; then
+            echo "[loop] llama-swap 재시작 완료"
         else
-            echo "[loop] Ollama 재시작 실패 — 이번 실행은 LLM 없이 진행되어 실패 기록될 수 있음"
+            echo "[loop] llama-swap 재시작 실패 — 이번 실행은 LLM 없이 진행되어 실패 기록될 수 있음"
         fi
     fi
 
     echo "[loop] 실행 시작: $(date '+%F %T')"
-    ./venv/bin/python run.py >> logs/cron.log 2>&1
+    ./venv/bin/python -m paperbot >> logs/cron.log 2>&1
     rc=$?
     echo "[loop] 실행 종료: $(date '+%F %T') (exit ${rc}) — 상세는 logs/cron.log"
 
-    # 후속 작업 훅 — paperbot이 끝난 직후 같은 GPU·모델로 돌릴 작업 (예: articlebot).
-    # scripts/after_run.sh는 로컬 전용(gitignore). paperbot 결과(rc)와 무관하게 실행하되,
-    # 멈춰도 다음 날 paperbot이 밀리지 않게 3시간 제한. VRAM 부족으로 건너뛴 날은 훅도 실행 안 됨.
-    if [ -x scripts/after_run.sh ]; then
-        echo "[loop] 후속 작업 시작: $(date '+%F %T')"
-        timeout 3h scripts/after_run.sh
-        echo "[loop] 후속 작업 종료: $(date '+%F %T') (exit $?)"
+    # 이어서 articlebot — 같은 GPU·모델을 쓰므로 paperbot이 끝난 직후 (articlebot/config.yaml이 있을 때만).
+    # paperbot 결과(rc)와 무관하게 실행하되, 멈춰도 다음 날 paperbot이 밀리지 않게 3시간 제한. VRAM 부족으로 건너뛴 날은 이것도 건너뜀.
+    if [ -f articlebot/config.yaml ]; then
+        echo "[loop] articlebot 시작: $(date '+%F %T')"
+        timeout 3h scripts/articlebot.sh
+        arc=$?
+        echo "[loop] articlebot 종료: $(date '+%F %T') (exit ${arc}) — 상세는 logs/articlebot_cron.log"
     fi
 done

@@ -10,12 +10,13 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, replace
 
-from . import summarizer
+from . import chatdb, summarizer
 from .config import Config
 from .extractor import extract
 from .filter import RelevanceFilter
 from .models import Paper
 from .publisher import PublishConfigError, make_publisher
+from . import replay as _replay   # [REPLAY] Zulip 되올리기 (한시적) — replay.py 참고
 from .sources import ArxivSource, SemanticScholarSource
 from .store import Store
 from .summarizer import LLMError
@@ -109,6 +110,7 @@ def process_paper(cfg, store, publisher, paper, client) -> bool:
         publisher.publish(paper, summary, abstract_only=extracted.abstract_only,
                           figures=extracted.figures)
         store.mark_done(paper)
+        chatdb.store_paper(cfg, paper, extracted, summary)   # 챗봇 캐시에 전문·요약 (실패해도 발행은 끝났으니 경고만)
         return True
     except PublishConfigError:
         raise  # 설정 문제 — 논문을 failed로 소모하지 않고 상위에서 실행 중단
@@ -123,8 +125,9 @@ def process_paper(cfg, store, publisher, paper, client) -> bool:
 
 
 def _select(cfg: Config, store: Store, passed: list[Paper], limit: int | None,
-            topics_by_name: dict) -> list[Paper]:
-    """pending 대기열 + 신규 통과분에 쿼터를 적용해 이번 실행 처리분을 고르고, 밀린 신규분은 pending으로."""
+            topics_by_name: dict, replay_items: list = ()) -> list[Paper]:   # [REPLAY] replay_items 인자만 지운다
+    """pending 대기열 + 신규 통과분에 쿼터를 적용해 이번 실행 처리분을 고르고, 밀린 신규분은 pending으로.
+    replay_items([REPLAY], Zulip 되올리기)가 있으면 그 topic의 신규는 빼고 --limit도 그만큼 줄여 센다."""
     expired = store.expire_pending(cfg.quota.pending_max_age_days)
     if expired:
         logger.info("pending 만료 폐기: %d편 (%d일 초과)", expired, cfg.quota.pending_max_age_days)
@@ -135,7 +138,9 @@ def _select(cfg: Config, store: Store, passed: list[Paper], limit: int | None,
     # topic(채널)×소스별 일일 발행 쿼터 — 대기열 먼저, 남은 자리는 신규 최신순.
     candidates = pending + passed
     selected = apply_quota(candidates, cfg.quota, topics_by_name)
+    selected = _replay.hold_new(selected, list(replay_items))   # [REPLAY] 되올리는 topic의 신규는 보류(아래에서 pending으로)
     if limit is not None:
+        limit = max(0, limit - len(replay_items))   # [REPLAY] --limit은 되올리기부터 센다
         selected = selected[:limit]
         logger.info("--limit 적용: %d편만 처리", len(selected))
     selected_uids = {p.uid for p in selected}
@@ -182,11 +187,24 @@ def run(cfg: Config, opts: RunOptions) -> int:
         n_passed = len(passed)
         logger.info("필터 통과 %d편 (미처리 %d편 중)", n_passed, len(todo))
 
-        selected = _select(cfg, store, passed, opts.limit, topics_by_name)
+        replay_items = _replay.select(cfg, store, publisher)[: opts.limit]   # [REPLAY] Zulip 되올리기 — 옛 논문 먼저
+        selected = _select(cfg, store, passed, opts.limit, topics_by_name, replay_items)   # [REPLAY] 마지막 인자만 지운다
 
         done = failed = 0
         config_error: PublishConfigError | None = None
+        for i, item in enumerate(replay_items, start=1):   # [REPLAY] 되올리기 블록 — 옛 논문을 다 올리면 통째로 지운다
+            logger.info("[되올리기 %d/%d] %s — %.80s", i, len(replay_items), item.uid, item.title)
+            try:
+                ok = _replay.process(cfg, store, publisher, item, client)
+            except PublishConfigError as e:
+                config_error = e
+                logger.error("전송 설정 오류로 실행 중단: %s", e)
+                break
+            done += ok
+            failed += not ok
         for i, paper in enumerate(selected, start=1):
+            if config_error:   # [REPLAY] 되올리기에서 설정 오류가 났으면 신규도 건너뛴다 (이 두 줄)
+                break          # [REPLAY]
             logger.info("[%d/%d] %s — %.80s", i, len(selected), paper.uid, paper.title)
             try:
                 ok = process_paper(cfg, store, publisher, paper, client)
@@ -203,7 +221,7 @@ def run(cfg: Config, opts: RunOptions) -> int:
                 failed += 1
 
     publisher.close()
-    if todo:  # LLM(judge/요약)을 실제로 썼을 때만 — GPU 즉시 반납
+    if summarizer.llm_used():  # 이 실행이 LLM(judge/요약)을 실제로 불렀을 때만 — GPU 즉시 반납 (ttl 10분을 기다리지 않음)
         summarizer.unload_model(cfg)
     logger.info(
         "완료: 검색 %d / 미처리 %d / 필터 통과 %d / 요약 완료 %d / 실패 %d",

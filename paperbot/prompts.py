@@ -30,10 +30,18 @@ SUMMARY_SYSTEM_PROMPT = """\
 - 각 섹션은 '###' 마크다운 헤딩을 사용한다.
 - 서론/맺음말/메타 발언(예: '요약하겠습니다') 없이 첫 헤딩부터 바로 시작한다.
 - <think> 같은 사고 과정을 출력에 포함하지 마라.
-
+{math_rule}
 출력 형식:
 {skeleton}
 """
+
+# 수식 표기 — 발행처별. Slack은 LaTeX를 렌더링하지 못하므로 평문, Zulip은 $$…$$(인라인)과 ```math 블록을 렌더링한다.
+MATH_RULES = {
+    "plain": "- 수식은 평문으로 적는다(예: O(n^2), x_i). LaTeX 명령은 쓰지 마라.\n",
+    "latex": ("- 수식은 LaTeX로 적는다: 인라인 수식은 $$...$$ 로 감싸되 **$$ 앞뒤에 반드시 공백을 하나씩 둔다** "
+              "(좋은 예: '그래프 $$G=(V,E)$$ 를', '복잡도는 $$O(n^2)$$ 이다' — 나쁜 예: '그래프$$G$$를', '$$O(n^2)$$이다'). "
+              "조사가 바로 붙어도 공백을 둔다. 여러 줄 수식은 ```math 로 시작해 ``` 로 끝나는 블록에 넣는다. 수식 밖에서는 LaTeX 명령을 쓰지 마라.\n"),
+}
 
 
 def _skeleton() -> str:
@@ -45,8 +53,9 @@ def _skeleton() -> str:
     return "\n".join(lines).rstrip()
 
 
-def build_summary_system_prompt(language: str) -> str:
-    return SUMMARY_SYSTEM_PROMPT.format(language=language, skeleton=_skeleton())
+def build_summary_system_prompt(language: str, math: str = "plain") -> str:
+    """math: "plain"(Slack) | "latex"(Zulip — $$…$$ 인라인, ```math 블록)."""
+    return SUMMARY_SYSTEM_PROMPT.format(language=language, skeleton=_skeleton(), math_rule=MATH_RULES[math])
 
 
 def build_summary_user_prompt(paper: Paper, body_text: str, abstract_only: bool) -> str:

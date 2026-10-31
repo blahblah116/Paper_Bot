@@ -26,12 +26,11 @@ import pymupdf
 from paperbot.extractor import extract_text, strip_references
 
 from .drive import DriveError, DriveUploader
-from .textcache import DRIVE_TYPE, TextCache
+from .textcache import DRIVE_TYPE, TEXT_MAX, TextCache
 from .zotero import ZoteroClient, collection_paths
 
 logger = logging.getLogger(__name__)
 
-_TEXT_MAX = 300_000          # 논문 하나당 저장할 본문 상한(자)
 _MIN_FULLTEXT = 500          # 이보다 짧은 Zotero 본문 색인은 무시하고 PDF 추출 시도
 _RETRY_HOURS = 6             # 본문을 못 받은 PDF(text_source='missing') 재시도 간격
 _FNAME_RE = re.compile(r"^(?P<who>[^-]+?) - (?:(?P<year>\d{4}) - )?(?P<title>.+)$")   # Zotero 파일명 형식
@@ -43,7 +42,7 @@ def _clean(text: str) -> str:
     text = text.replace("\x00", "")
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()[:_TEXT_MAX]
+    return text.strip()[:TEXT_MAX]
 
 
 def nfc(s: str) -> str:

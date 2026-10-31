@@ -1,8 +1,11 @@
-"""Socket Mode listener: routes Slack events to the handlers and runs library sync in the background.
-Slack Socket Mode 리스너 — 이벤트를 핸들러로 라우팅하고 라이브러리 동기화를 백그라운드로 돌린다.
+"""Listener: routes Slack (Socket Mode) and Zulip (event queue) messages to the handlers; background library sync.
+리스너 — Slack(Socket Mode)·Zulip(이벤트 큐) 메시지를 핸들러로 라우팅하고 라이브러리 동기화를 백그라운드로 돌린다.
 
-- 채널 멘션(app_mention) → 저장 큐, DM(message.im) → 챗 큐. 큐·워커 스레드가 분리돼 있어
+- Slack: 채널 멘션(app_mention) → 저장 큐, DM(message.im) → 챗 큐. 큐·워커 스레드가 분리돼 있어
   DM 답변(LLM, 느림)이 저장 명령을 막지 않는다. DM 안의 멘션은 message.im으로 이미 받으므로 무시.
+- Zulip: DM만 받는다. 첫 단어가 '저장/save'면 저장 큐(링크·인용·메시지 링크에서 논문 식별), 나머지는 챗 큐.
+  두 플랫폼이 같은 큐·핸들러를 쓰므로 LLM 작업은 여전히 한 번에 하나만 돈다.
+- 핸들러가 받는 bot은 MultiBot — ev["platform"]으로 SlackBot/ZulipBot을 고른다.
 - 봇 자신에게 온 이벤트만 처리한다(앱에 '사용자 이벤트'가 구독돼 있으면 남의 DM까지 들어오므로 버림).
 - 동기화(sync_library)는 DM이 올 때(마지막 확인 후 sync_interval_min 경과 시)와 저장 직후 백그라운드로
   한 번에 하나만 돈다. DM은 기다리지 않고 현재 캐시로 답한다(Drive 응답이 2~40초로 들쭉날쭉 — 실측).
@@ -19,21 +22,68 @@ from .agent import Agent
 from .config import Config
 from .drive import DriveUploader
 from .handlers import ChatHandler, SaveHandler
-from .messages import esc
+from .messages import esc, find_refs, parse_zulip_dm
 from .slackbot import SlackBot
 from .sync import sync_library
 from .textcache import TextCache
 from .zotero import ZoteroClient
+from .zulipbot import ZulipBot
 
 logger = logging.getLogger("zoterobot")
 
 
+class MultiBot:
+    """플랫폼별 봇(SlackBot/ZulipBot)을 ev["platform"]으로 고르는 얇은 디스패처 — 핸들러는 플랫폼을 모른다.
+    update(channel, ts, …)는 ev가 없으므로 채널 키("zulip:dm:…")로 가른다."""
+
+    def __init__(self, bots: dict):
+        if not bots:
+            raise ValueError("봇이 하나도 없습니다 (Slack 토큰 또는 zulip.enabled 필요)")
+        self.bots = bots
+        self.default = "slack" if "slack" in bots else next(iter(bots))
+
+    def _for(self, ev: dict):
+        return self.bots.get(ev.get("platform", "slack")) or self.bots[self.default]
+
+    def _for_channel(self, channel: str):
+        key = "zulip" if str(channel).startswith("zulip:") else "slack"
+        return self.bots.get(key) or self.bots[self.default]
+
+    def reply(self, ev: dict, text: str, thread: bool = True) -> dict:
+        return self._for(ev).reply(ev, text, thread=thread)
+
+    def update(self, channel: str, ts: str, text: str) -> None:
+        self._for_channel(channel).update(channel, ts, text)
+
+    def react(self, ev: dict, name: str, remove: bool = False) -> None:
+        self._for(ev).react(ev, name, remove=remove)
+
+    def parent_text(self, ev: dict) -> str:
+        return self._for(ev).parent_text(ev)
+
+    def allowed(self, ev: dict, thread: bool) -> bool:
+        return self._for(ev).allowed(ev, thread)
+
+    def fmt(self, ev: dict):
+        return self._for(ev).fmt
+
+    def update_every(self, ev: dict) -> float:
+        return self._for(ev).update_every
+
+
 class Listener:
     def __init__(self, cfg: Config, web, zot: ZoteroClient, drive: DriveUploader,
-                 cache: TextCache | None = None, agent: Agent | None = None, bot_user_id: str = ""):
+                 cache: TextCache | None = None, agent: Agent | None = None, bot_user_id: str = "",
+                 zulip: ZulipBot | None = None):
         self.cfg, self.zot, self.drive, self.cache = cfg, zot, drive, cache
         self.bot_user_id = bot_user_id
-        self.bot = SlackBot(web, cfg.allowed_users)
+        bots: dict = {}
+        if web is not None:
+            bots["slack"] = SlackBot(web, cfg.allowed_users)
+        if zulip is not None:
+            bots["zulip"] = zulip
+        self.zulip = zulip
+        self.bot = MultiBot(bots)
         self.save = SaveHandler(cfg, self.bot, zot, drive, on_saved=self._after_save)
         self.chat = ChatHandler(cfg, self.bot, cache, agent, on_question=self.kick_sync)
         self.jobs: queue.Queue = queue.Queue()      # 저장 명령 (빠름)
@@ -105,6 +155,29 @@ class Listener:
             return
         (self.chats if is_dm else self.jobs).put(ev)
 
+    def on_zulip_message(self, msg: dict) -> None:
+        """Zulip 이벤트 스레드 콜백 — DM만: '저장 …'은 저장 큐, 나머지는 챗 큐. 봇 자신의 메시지는 버린다."""
+        if self.zulip is None:
+            return
+        ev = self.zulip.to_event(msg)
+        if ev is None:
+            return
+        cmd = parse_zulip_dm(ev["text"])
+        logger.info("Zulip DM 수신 user=%s kind=%s", ev.get("user"), cmd.kind)
+        if self.draining.is_set():
+            try:
+                self.bot.reply(ev, "🔄 봇이 재시작 중입니다 — 1분쯤 뒤에 다시 보내 주세요.", thread=False)
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        ev["text"] = cmd.text
+        if cmd.kind == "save":
+            if cmd.message_ids and not find_refs(cmd.text):
+                ev["thread_ts"] = str(cmd.message_ids[0])   # 식별자가 없으면 링크된 메시지(논문 원글)에서 찾는다
+            self.jobs.put(ev)
+        else:
+            self.chats.put(ev)
+
     def _for_bot(self, auths: list[dict]) -> bool:
         """봇 자신에게 온 이벤트만 처리. authorizations에 봇이 없는 이벤트는 내용을 보지 않고 버린다."""
         if not auths or any(a.get("is_bot") or a.get("user_id") == self.bot_user_id for a in auths):
@@ -155,7 +228,10 @@ class Listener:
 
     def kick_sync(self) -> bool:
         """라이브러리 동기화가 필요하면 백그라운드 스레드로 시작 (이미 도는 중이면 생략). 시작했으면 True."""
-        if self.cache is None or not self.cache.check_due(self.cfg.chat.sync_interval_min):
+        if self.cache is None:
+            return False
+        self.cache.refresh_if_changed()   # paperbot/articlebot이 수집 문서를 넣었으면 바로 반영 (쿼리 하나)
+        if not self.cache.check_due(self.cfg.chat.sync_interval_min):
             return False
         if not self._sync_running.acquire(blocking=False):
             return False

@@ -44,6 +44,23 @@ def make_uid(arxiv_id: str | None, doi: str | None, s2_id: str | None) -> str:
     raise ValueError("uid를 만들 식별자가 없습니다 (arxiv_id/doi/s2_id 모두 None)")
 
 
+
+def uid_url_key(uid: str) -> str:
+    """uid → 그 논문 링크의 핵심 부분(스킴 없이). arXiv abs > doi.org > S2 페이지 — 발행 메시지 '📄 링크'에 그대로 들어가므로
+    Zulip에 이미 올린 글을 찾을 때(되올리기·챗봇 캐시 백필)의 키로 쓴다."""
+    kind, _, value = uid.partition(":")
+    if kind == "arxiv":
+        return f"arxiv.org/abs/{value}"
+    if kind == "doi":
+        return f"doi.org/{value}"
+    return f"semanticscholar.org/paper/{value}"
+
+
+def canonical_url(uid: str) -> str:
+    """uid 기준의 사람이 여는 링크 (S2 페이지만 www.)."""
+    return "https://" + ("www." if uid.startswith("s2:") else "") + uid_url_key(uid)
+
+
 @dataclass
 class Paper:
     uid: str

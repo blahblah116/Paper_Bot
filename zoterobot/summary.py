@@ -51,7 +51,7 @@ class SummaryResult:
 def doc_to_paper(d: Doc) -> Paper:
     """캐시 문서 → paperbot 요약 프롬프트용 Paper (venue는 캐시에 없어 출처 표기만)."""
     return Paper(uid=d.key, title=d.title, authors=list(d.authors), abstract=d.abstract or None,
-                 venue="Zotero library", year=int(d.year) if str(d.year).isdigit() else None, url=d.url,
+                 venue=d.origin or "Zotero library", year=int(d.year) if str(d.year).isdigit() else None, url=d.url,
                  pdf_url=None, arxiv_id=None, doi=None, citation_count=None, source="zotero",
                  topic_name=d.collections[0] if d.collections else "")
 
@@ -83,6 +83,8 @@ class PaperSummarizer:
 
     def fetch_text(self, d: Doc, on_status=None) -> tuple[str, str]:
         """PDF를 받아 본문 텍스트 추출 → (본문, 출처 'drive:…'/'zotero:…')."""
+        if d.feed:
+            raise SummaryError("수집 문서인데 캐시에 본문이 없습니다(초록만) — 초록·저장된 요약 범위에서 답하세요")
         cands = self.locate(d)
         if not cands:
             raise SummaryError("이 논문의 PDF 첨부를 찾지 못했습니다")

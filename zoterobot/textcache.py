@@ -1,12 +1,18 @@
 """Library text cache (sqlite): documents, keyword search and reading for the chat tools.
 라이브러리 본문 텍스트 캐시 — 문서 저장·키워드 검색·발췌 (DM 챗봇 도구용, 임베딩 모델 없음).
 
-문서 = Zotero 최상위 항목(논문) 또는 Drive 폴더에만 있는 PDF(item_type = DRIVE_TYPE).
-채우는 쪽은 sync.py(sync_library). 이 모듈은 저장소와 조회만 담당한다.
+문서 네 종류 (item_type으로 구분, 검색 범위 scope는 library/feed/all):
+  - Zotero 최상위 항목(논문)                         → library   (채움: sync.py)
+  - Drive 폴더에만 있는 PDF (DRIVE_TYPE)             → library   (채움: sync.py, drive_scan)
+  - paperbot이 아침에 요약해 올린 논문 (PAPERBOT_TYPE) → feed      (채움: paperbot/chatdb.py — 본문·요약을 같이 넣는다)
+  - articlebot이 올린 연구 블로그 글 (ARTICLE_TYPE)    → feed      (채움: articlebot/chatdb.py)
+feed 문서의 id는 uid 해시('P…'/'A…', feed_key), sig에 uid를 둔다. 컬렉션 자리에는 paperbot topic 이름 / 기관명이 들어간다.
+paperbot·articlebot은 다른 프로세스에서 이 DB에 쓰므로, 리스너는 refresh_if_changed()로 바뀐 걸 알아채 메모리 캐시를 다시 읽는다.
 검색: 키워드별로 제목(가중 6)·초록(3)·본문(log 횟수, 상한 4) 점수 + 키워드 커버리지 보정. 하이픈·대소문자 무시.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -19,7 +25,35 @@ from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
-DRIVE_TYPE = "drive_pdf"      # Zotero에 없고 Drive 폴더에만 있는 PDF (item_type 값)
+DRIVE_TYPE = "drive_pdf"            # Zotero에 없고 Drive 폴더에만 있는 PDF (item_type 값)
+PAPERBOT_TYPE = "paperbot_paper"    # paperbot이 요약해 올린 논문 (Zotero/Drive에는 없을 수 있음)
+ARTICLE_TYPE = "blog_article"       # articlebot이 올린 연구 블로그 글
+FEED_TYPES = (PAPERBOT_TYPE, ARTICLE_TYPE)
+SCOPES = ("all", "library", "feed")
+SCOPE_LABELS = {"library": "라이브러리", "feed": "수집분"}   # scope='all'의 이름은 쓰는 곳마다 다르다('전체' 등)
+_LIST_MAX = 120                     # list_papers 한 번에 보여줄 최대 줄 수 (feed가 수백 편이라 전부 넣으면 컨텍스트가 넘친다)
+TEXT_MAX = 300_000                  # 문서 하나당 저장할 본문 상한(자) — sync.py도 이 값을 쓴다
+
+
+def feed_key(item_type: str, uid: str) -> str:
+    """수집 문서 id — Zotero 키처럼 8자: 'P'(논문)/'A'(글) + uid 해시 7자. 같은 uid면 늘 같은 id라 재실행해도 덮어쓴다."""
+    prefix = "P" if item_type == PAPERBOT_TYPE else "A"
+    return prefix + hashlib.sha1(uid.strip().encode()).hexdigest()[:7].upper()
+
+
+def is_feed(item_type: str) -> bool:
+    return item_type in FEED_TYPES
+
+
+def origin_label(item_type: str) -> str:
+    """사람·모델에게 보여줄 출처 표시 (라이브러리 문서는 빈 문자열)."""
+    if item_type == PAPERBOT_TYPE:
+        return "paperbot 수집"
+    if item_type == ARTICLE_TYPE:
+        return "블로그 글"
+    if item_type == DRIVE_TYPE:
+        return "Drive 전용"
+    return ""
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS docs (
@@ -45,6 +79,8 @@ CREATE TABLE IF NOT EXISTS summaries (          -- summarize_paper 결과 (summa
     created_at TEXT
 );
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+-- refresh_if_changed()의 COUNT/MAX(updated_at)를 본문 페이지 없이 인덱스만으로 (NAS에서 644ms → 3ms, 2026-10-23 실측)
+CREATE INDEX IF NOT EXISTS docs_updated_at ON docs(updated_at);
 """
 _SNIPPET = 160               # 검색 스니펫 반경(자)
 
@@ -82,24 +118,38 @@ class Doc:
     def __post_init__(self):
         self._t, self._a, self._b = norm(self.title), norm(self.abstract), norm(self.text)
 
+    @property
+    def feed(self) -> bool:
+        return is_feed(self.item_type)
+
+    @property
+    def origin(self) -> str:
+        return origin_label(self.item_type)
+
     def line(self) -> str:
-        """카탈로그 한 줄: id | 제목 | 첫 저자 연도 | 컬렉션 — 시스템 프롬프트·목록 도구가 쓴다."""
+        """카탈로그 한 줄: id | 제목 | 첫 저자 연도 | 컬렉션(수집 문서는 topic/기관) — 시스템 프롬프트·목록 도구가 쓴다."""
         colls = ", ".join(self.collections) or "-"
         who = f"{short_authors(self.authors)} {self.year}".strip()
-        mark = " [Drive 전용]" if self.item_type == DRIVE_TYPE else ""
+        mark = f" [{self.origin}]" if self.origin else ""
         return f"{self.key} | {self.title} | {who} | {colls}{mark}"
 
 
 class TextCache:
     def __init__(self, db_path: str):
         os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        # timeout: paperbot/articlebot이 다른 프로세스에서 같은 파일에 쓰는 동안 잠깐 잠겨도 기다린다
+        self.conn = sqlite3.connect(db_path, check_same_thread=False, timeout=30)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(_SCHEMA)
         self.conn.commit()
         self.lock = threading.RLock()        # 동기화(sync_library)가 잡는다
         self._docs: list[Doc] | None = None
+        self._loaded_stamp: tuple | None = None   # docs()를 읽을 때의 (문서 수, 마지막 갱신 시각) — 외부 변경 감지용
         self._last_check: datetime | None = None
+
+    def close(self) -> None:
+        """paperbot/articlebot처럼 잠깐 열어 쓰는 쪽이 부른다 (리스너는 프로세스가 끝날 때까지 연다)."""
+        self.conn.close()
 
     # --- meta / 동기화 시점 ---
     def get_meta(self, key: str, default: str = "") -> str:
@@ -139,6 +189,30 @@ class TextCache:
              meta["item_type"], sig, text, source, datetime.now(timezone.utc).isoformat()))
         self.conn.commit()
 
+    def upsert_feed(self, item_type: str, uid: str, meta: dict, text: str, text_source: str,
+                    summary: str | None = None, model: str = "") -> str:
+        """수집 문서(paperbot 논문 / articlebot 글) 저장 → id. meta: title·authors·year·collections·abstract·url.
+        summary가 있으면 summaries 테이블에도 넣어 read_paper·search_papers가 바로 쓴다. 다른 프로세스가 부른다."""
+        key = feed_key(item_type, uid)
+        meta = {**meta, "item_type": item_type}
+        text = (text or "")[:TEXT_MAX]
+        with self.lock:
+            self.upsert(key, meta, f"{item_type}|{uid}", text, text_source if text else "none")
+            if summary:
+                self.set_summary(key, summary, f"{item_type}:{uid}", len(text), model)
+        self.invalidate()
+        return key
+
+    def has_feed_text(self, item_type: str, uid: str) -> bool:
+        """같은 uid의 수집 문서가 본문과 함께 이미 있는지 (백필 재실행 시 건너뛰기용)."""
+        r = self.conn.execute("SELECT length(text) FROM docs WHERE item_key=?",
+                              (feed_key(item_type, uid),)).fetchone()
+        return bool(r and r[0])
+
+    def feed_counts(self) -> dict[str, int]:
+        return {r[0]: r[1] for r in self.conn.execute(
+            "SELECT item_type, COUNT(*) FROM docs WHERE item_type IN (?, ?) GROUP BY item_type", FEED_TYPES)}
+
     def update_collections(self, key: str, collections: list[str]) -> None:
         self.conn.execute("UPDATE docs SET collections=? WHERE item_key=?",
                           (json.dumps(collections, ensure_ascii=False), key))
@@ -165,9 +239,10 @@ class TextCache:
         self.conn.commit()
 
     def known_zotero(self) -> dict[str, tuple[str, str, str]]:
-        """Zotero 문서 key → (sig, text_source, updated_at)."""
+        """Zotero 문서 key → (sig, text_source, updated_at). Drive 전용·수집 문서는 제외 — 동기화가 지우면 안 된다."""
         return {r["item_key"]: (r["sig"], r["text_source"], r["updated_at"]) for r in self.conn.execute(
-            "SELECT item_key, sig, text_source, updated_at FROM docs WHERE item_type != ?", (DRIVE_TYPE,))}
+            "SELECT item_key, sig, text_source, updated_at FROM docs WHERE item_type NOT IN (?, ?, ?)",
+            (DRIVE_TYPE, *FEED_TYPES))}
 
     def known_drive(self) -> dict[str, str]:
         """Drive 전용 문서 key → sig."""
@@ -183,6 +258,26 @@ class TextCache:
     def invalidate(self) -> None:
         self._docs = None
 
+    def _stamp(self) -> tuple:
+        r = self.conn.execute("SELECT COUNT(*), MAX(updated_at) FROM docs").fetchone()
+        return (r[0], r[1] or "")
+
+    def refresh_if_changed(self) -> bool:
+        """다른 프로세스(paperbot·articlebot 백필/아침 실행)가 DB를 바꿨으면 메모리 캐시를 버린다. 바꿨으면 True.
+        쿼리 하나라 DM마다 불러도 된다."""
+        if self._docs is None:
+            return False
+        try:
+            stamp = self._stamp()
+        except sqlite3.Error as e:
+            logger.debug("캐시 변경 확인 실패(무시): %s", e)
+            return False
+        if stamp == self._loaded_stamp:
+            return False
+        logger.info("본문 캐시가 밖에서 바뀜 (%s → %s) — 다시 읽음", self._loaded_stamp, stamp)
+        self.invalidate()
+        return True
+
     # --- 조회 ---
     def docs(self) -> list[Doc]:
         cached = self._docs
@@ -190,12 +285,14 @@ class TextCache:
             return cached
         with self.lock:
             if self._docs is None:
+                stamp = self._stamp()
                 rows = self.conn.execute("SELECT * FROM docs ORDER BY title").fetchall()
                 self._docs = [Doc(key=r["item_key"], title=r["title"], authors=json.loads(r["authors"] or "[]"),
                                   year=r["year"] or "", collections=json.loads(r["collections"] or "[]"),
                                   abstract=r["abstract"] or "", url=r["url"] or "", item_type=r["item_type"] or "",
                                   text=r["text"] or "", text_source=r["text_source"] or "none")
                               for r in rows]
+                self._loaded_stamp = stamp
             return self._docs
 
     def get(self, key: str) -> Doc | None:
@@ -232,8 +329,18 @@ class TextCache:
                 return cands[0]
         return None
 
-    def _filter(self, collection: str | None) -> list[Doc]:
+    @staticmethod
+    def norm_scope(scope: str | None) -> str:
+        s = (scope or "all").strip().lower()
+        return s if s in SCOPES else "all"
+
+    def _filter(self, collection: str | None, scope: str | None = None) -> list[Doc]:
+        scope = self.norm_scope(scope)
         docs = self.docs()
+        if scope == "library":
+            docs = [d for d in docs if not d.feed]
+        elif scope == "feed":
+            docs = [d for d in docs if d.feed]
         if collection:
             want = norm(collection)
             docs = [d for d in docs if any(want in norm(c) for c in d.collections)]
@@ -242,19 +349,31 @@ class TextCache:
     def catalog(self) -> list[str]:
         return [d.line() for d in self.docs()]
 
-    def list_papers(self, collection: str | None = None) -> str:
-        docs = self._filter(collection)
-        if not docs:
-            names = sorted({c for d in self.docs() for c in d.collections}, key=str.lower)
-            return f"'{collection}' 컬렉션에 논문이 없습니다. 있는 컬렉션: {', '.join(names)}"
-        return f"{len(docs)}편 (id | 제목 | 첫 저자 연도 | 컬렉션)\n" + "\n".join(d.line() for d in docs)
+    def collection_names(self, scope: str | None = None) -> list[str]:
+        return sorted({c for d in self._filter(None, scope) for c in d.collections}, key=str.lower)
 
-    def search(self, keywords: list[str], collection: str | None = None, limit: int = 8) -> list[dict]:
+    def list_papers(self, collection: str | None = None, scope: str | None = None) -> str:
+        scope = self.norm_scope(scope)
+        docs = self._filter(collection, scope)
+        if not docs:
+            names = self.collection_names(scope)
+            where = SCOPE_LABELS.get(scope, "전체")
+            return (f"'{collection}' 컬렉션에 문서가 없습니다 ({where}). 있는 컬렉션/주제: {', '.join(names)}" if collection
+                    else f"{where}에 문서가 없습니다.")
+        head = f"{len(docs)}편 (id | 제목 | 첫 저자 연도 | 컬렉션·주제 [출처])"
+        if len(docs) > _LIST_MAX:
+            # 수집 문서는 수백 편이라 전부 나열하지 않는다 — 최근 것부터 일부만 보여주고 검색을 권한다
+            docs = sorted(docs, key=lambda d: d.year, reverse=True)[:_LIST_MAX]
+            head += f" — 너무 많아 최근 {_LIST_MAX}편만. 특정 내용은 search_papers로 찾을 것"
+        return head + "\n" + "\n".join(d.line() for d in docs)
+
+    def search(self, keywords: list[str], collection: str | None = None, limit: int = 8,
+               scope: str | None = None) -> list[dict]:
         kws = [norm(k) for k in keywords if norm(k)][:8]
         if not kws:
             return []
         scored = []
-        for d in self._filter(collection):
+        for d in self._filter(collection, scope):
             score, matched = 0.0, {}
             for kw in kws:
                 t, a, b = d._t.count(kw), d._a.count(kw), d._b.count(kw)
@@ -264,13 +383,19 @@ class TextCache:
             if matched:
                 score *= 0.5 + 0.5 * len(matched) / len(kws)
                 scored.append((score, d, matched))
-        scored.sort(key=lambda x: -x[0])
+        # 라이브러리에도 있고 paperbot도 올린 같은 논문은 하나만 — 점수와 무관하게 라이브러리 쪽(사용자가 저장한 것)을 남긴다
+        best: dict[str, tuple] = {}
+        for score, d, matched in scored:
+            cur = best.get(d._t)
+            if cur is None or (cur[1].feed and not d.feed) or (cur[1].feed == d.feed and score > cur[0]):
+                best[d._t] = (score, d, matched)
+        ranked = sorted(best.values(), key=lambda x: (-x[0], x[1].feed))
         out = []
-        for score, d, matched in scored[:limit]:
+        for score, d, matched in ranked[:limit]:
             rare = min(matched, key=lambda k: matched[k])
             out.append({"id": d.key, "title": d.title, "authors": short_authors(d.authors), "year": d.year,
-                        "collections": d.collections, "score": round(score, 2), "matches": matched,
-                        "snippet": self._snippet(d, rare)})
+                        "collections": d.collections, "origin": d.origin, "score": round(score, 2),
+                        "matches": matched, "snippet": self._snippet(d, rare)})
         return out
 
     @staticmethod
@@ -292,7 +417,8 @@ class TextCache:
         if d is None:
             return f"id '{key}'인 논문이 없습니다. search_papers나 list_papers로 id를 확인하세요."
         head = (f"제목: {d.title}\n저자: {', '.join(d.authors[:8])}{' 외' if len(d.authors) > 8 else ''}\n"
-                f"연도: {d.year or '-'} · 컬렉션: {', '.join(d.collections) or '-'} · URL: {d.url or '-'}\n"
+                f"연도: {d.year or '-'} · 컬렉션/주제: {', '.join(d.collections) or '-'}"
+                + (f" · 출처: {d.origin}" if d.origin else "") + f" · URL: {d.url or '-'}\n"
                 f"초록: {d.abstract or '(없음)'}\n\n")
         s = self.get_summary(d.key)
         if s:   # summarize_paper가 만든 전문 요약 — 후속 질문에 바로 쓰이게 본문 앞에

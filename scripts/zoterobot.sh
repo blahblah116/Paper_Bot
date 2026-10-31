@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # zoterobot tmux 러너 — Slack 저장 명령 + DM 챗봇 상주 프로세스.
-# 리스너 자체는 GPU를 쓰지 않는다(DM이 올 때만 Ollama가 모델을 올리고 keep_alive 후 내림).
+# 리스너 자체는 GPU를 쓰지 않는다(DM이 올 때만 llama-swap이 모델을 올리고 ttl 10분 뒤 내림).
 # 프로세스가 죽으면 30초 뒤 재시작, 설정·인증 오류(exit 2)면 10분 뒤 재시도.
 #
 # 사용:

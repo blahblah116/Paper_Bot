@@ -1,9 +1,13 @@
-# Shared by paperbot and zoterobot (one venv). Install torch (CPU wheel) first — see README.
-# paperbot·zoterobot 공용 (venv 하나). torch는 CPU 휠을 먼저 설치할 것 — README 참조.
+# Shared by paperbot, articlebot and zoterobot (one venv). Install torch (CPU wheel) first — see README.
+# paperbot·articlebot·zoterobot 공용 (venv 하나). torch는 CPU 휠을 먼저 설치할 것 — README 참조.
 arxiv
 requests
 pymupdf
 openai
 pyyaml
 sentence-transformers   # paperbot relevance filter (embedding)
+doclayout-yolo          # paperbot figure/table detection for attachments (CPU). torchvision must match the torch CPU wheel — see README
+lxml                    # articlebot HTML body extraction
+Pillow                  # articlebot image checks / re-encoding
 slack_sdk               # zoterobot (Socket Mode listener)
+zulip                   # Zulip posting (paperbot topics with platform: zulip, articlebot backend: zulip) and the zoterobot Zulip DM listener

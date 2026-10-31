@@ -5,10 +5,15 @@ from __future__ import annotations
 
 import logging
 
+from .messages import SLACK
+
 logger = logging.getLogger(__name__)
 
 
 class SlackBot:
+    fmt = SLACK
+    update_every = 2.5                      # DM 답변 스트리밍 시 chat.update 최소 간격(초) — Slack rate limit 여유
+
     def __init__(self, web, allowed_users: list[str]):
         self.web = web                      # slack_sdk.WebClient (테스트에서는 가짜)
         self.allowed_users = allowed_users

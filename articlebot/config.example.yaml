@@ -1,0 +1,116 @@
+# articlebot 설정 예시 — 이 파일을 config.yaml로 복사한 뒤 값을 채우세요:
+#   cp articlebot/config.example.yaml articlebot/config.yaml   (리포 루트에서)
+# 실제 config.yaml은 .gitignore 처리되어 커밋되지 않습니다.
+
+sources:
+  # name은 DB 기록 키라 운영 중 바꾸지 말 것. label은 Slack에 표시되는 출처 이름.
+  # org(기관)는 하루 발행 상한(report.per_org)의 단위 — 같은 org의 피드들은 백로그를 함께 쓴다.
+  # 모든 소스는 기본으로 LLM judge를 거친다 (judge: false로 끌 수 있음).
+  - name: google_research
+    label: "Google Research"
+    org: "Google Research"
+    feed: "https://research.google/blog/rss/"
+
+  - name: deepmind
+    label: "Google DeepMind"
+    org: "Google DeepMind"
+    feed: "https://deepmind.google/blog/rss.xml"   # 일부 글은 blog.google로 리다이렉트됨 (둘 다 지원)
+
+  - name: nvidia_tech
+    label: "NVIDIA Technical Blog"
+    org: "NVIDIA"
+    feed: "https://developer.nvidia.com/blog/feed/"
+    # exclude_categories: ["Gaming"]   # 피드 category로 채점 전에 제외도 가능 (대소문자 무시)
+
+  # Meta: ai.meta.com/blog는 robots.txt에 "서면 허가 없는 자동 수집 금지"가 명시돼 있어 쓰지 않는다.
+  # 대신 Meta가 공식 제공하는 RSS 두 개를 한 기관(Meta)으로 묶는다.
+  - name: meta_engineering
+    label: "Engineering at Meta"
+    org: "Meta"
+    feed: "https://engineering.fb.com/category/ml-applications/feed/"
+
+  - name: meta_newsroom_ai
+    label: "Meta Newsroom (AI)"
+    org: "Meta"
+    feed: "https://about.fb.com/news/tag/ai/feed/"
+
+  # 아래는 검증된 추가 후보 (enabled: true로 켜면 됨)
+  - name: ai2
+    label: "Ai2"
+    org: "Ai2"
+    feed: "https://allenai.org/rss.xml"          # OlmoEarth, 기후 에뮬레이터(ACE) 등
+    enabled: false
+
+  - name: msr
+    label: "Microsoft Research"
+    org: "Microsoft Research"
+    feed: "https://www.microsoft.com/en-us/research/feed/"
+    enabled: false
+
+judge:
+  # 채점 기준. LLM이 제목·카테고리·본문 앞부분을 보고 0~10점을 매긴다.
+  interest: >
+    Research-oriented AI/ML content: new models, algorithms, training or inference
+    methods, benchmarks, and technical deep-dives that report substantive results.
+    Especially interested in geospatial / Earth AI (urban, population, weather, climate, remote sensing),
+    graph learning, LLM agents, and foundation models beyond text — e.g., tabular foundation
+    models, time-series foundation models, and scientific or domain foundation models
+    (their architecture, pretraining, and zero-shot / in-context capabilities).
+    Exclude product launches without technical depth, marketing, event recaps,
+    partnerships, investments, hardware or gaming news, customer stories, and
+    step-by-step SDK tutorials.
+  threshold: 5                   # 이 점수 미만은 버림 (filtered_out)
+  excerpt_chars: 3000            # judge에 넣을 본문 앞부분 길이
+
+report:
+  per_org: 1                     # 기관별 하루 발행 수 — 백로그에서 게시일 최신순으로 꺼낸다
+                                 # (새 글이 있으면 그게 가장 최신, 없으면 백로그의 다음 최신 글)
+  max_attempts: 3                # 기관별로 처리 실패 시 다음 후보를 시도하는 최대 횟수
+
+fetch:
+  interval_days: 3               # 수집(피드 확인·채점) 주기(일). 사이 날에는 백로그에서만 발행 — 쌓고 소진하고 다시 쌓기
+                                 # 날짜 기준 (마지막 수집일 + 3일째 실행에서 수집). 1 이하 = 매 실행
+  lookback_days: 90              # 이 기간 안에 게시된 글만 수집·백로그 대상 (더 오래된 백로그는 expired)
+  timeout: 30
+  user_agent: "articlebot/0.1 (research blog digest bot)"   # 브라우저 흉내 X — 봇임을 밝힌다
+  min_interval: 1.0              # 같은 호스트 연속 요청 간격(초)
+  min_body_chars: 400            # 본문이 이보다 짧으면 피드 본문 폴백, 그래도 짧으면 실패 처리
+
+images:
+  attach: true                   # 스레드에 그림 첨부 — Slack 앱에 files:write 스코프 필요
+  max_images: 4                  # 글당 첨부 상한. 후보가 더 많으면 LLM이 캡션을 보고 대표 그림을 고름
+  max_candidates: 12             # 다운로드·검사할 후보 수 (본문 등장 순)
+  hero: "fallback"               # og:image: fallback(본문 그림이 없을 때만) | always | never
+  min_width: 320                 # 아이콘·작은 썸네일 제외 기준
+  min_height: 160
+  max_upload_bytes: 8000000      # 초과 시 JPEG 재인코딩 / 애니메이션 GIF는 첫 프레임
+  max_side: 2400                 # 긴 변 축소 기준
+
+llm:                             # paperbot과 같은 LLM 서버·모델 (llama-swap → llama-server CUDA)
+  base_url: "http://localhost:8090/v1"
+  model: "qwen3.8:27b"
+  max_input_chars: 60000         # 블로그 본문은 보통 5k~20k자
+  max_output_tokens: 4096
+  temperature: 0.3
+  language: "ko"
+  unload_after_run: true         # 끝나면 모델 언로드 (VRAM 즉시 반납)
+  peer_lockfiles:                # 이 봇들이 실행 중이면 언로드하지 않음 (같은 모델 공유)
+    - "../data/.lock"            # paperbot (lockfile next to its storage.db_path) — 상대 경로는 이 파일 기준
+
+publisher:
+  backend: "slack"               # "slack" | "zulip" — 어디로 보낼지
+  dry_run: false                 # true면 전송 대신 stdout + data/preview에 저장
+
+slack:                           # backend: slack
+  channel: "#article"            # 채널명 또는 채널 ID — 봇 초대(/invite @봇) 필수
+  # 봇 토큰은 환경변수 SLACK_BOT_TOKEN으로 주입 (paperbot과 같은 ~/.paperbot_env 사용)
+
+zulip:                           # backend: zulip — 스트림 안의 고정 topic에 글마다 첫 메시지 → 요약 → 그림 순으로 이어 올린다
+  stream: "papers"               # 스트림 이름 — 봇(paperbot과 같은 Generic bot) 구독 필수
+  topic: "articles"              # 스트림 안의 topic (60자 이하). 소스별 channel 설정은 Zulip에서는 무시
+  config_file: "../zuliprc"      # 예비용(레포 루트, paperbot과 공용) — 보통은 ~/.paperbot_env의 ZULIP_EMAIL·ZULIP_API_KEY·ZULIP_SITE를 쓴다(있으면 우선)
+
+storage:
+  db_path: "./data/articles.db"  # 처리 이력 + 백로그 (NAS는 절대 경로)
+  preview_dir: "./data/preview"  # dry-run 미리보기(요약·그림) 저장 위치
+  chat_text_db: ""               # zoterobot 본문 캐시(zoterobot/config.yaml의 chat.text_db) — 발행한 글의 본문·요약을 넣어 DM 챗봇이 찾게 한다. 비면 끔

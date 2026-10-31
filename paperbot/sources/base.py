@@ -21,5 +21,5 @@ class PaperSource(abc.ABC):
         """topic 하나에 대한 검색 결과를 Paper 리스트로 반환.
 
         해당 topic에서 이 소스가 비활성이면 빈 리스트를 반환한다.
-        예외는 호출자(run.py)가 소스 단위로 격리한다.
+        예외는 호출자(pipeline.fetch_all)가 소스 단위로 격리한다.
         """

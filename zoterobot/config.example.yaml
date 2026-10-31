@@ -9,6 +9,14 @@
 allowed_users: []             # Slack user IDs allowed to use the bot (e.g. "U01ABCDEF"). Empty = reject everyone;
                               # the rejection reply shows the caller's ID. / 허용 사용자 ID. 비면 전부 거절(거절 답글에 ID 표시)
 
+zulip:                        # Zulip entry point: DMs to the same bot account paperbot posts with (zuliprc). Works with or without Slack.
+                              # Zulip 입구 — paperbot이 글을 올리는 봇 계정(zuliprc)으로 오는 DM. Slack과 함께 또는 Slack 없이 동작
+  enabled: false
+  config_file: "../zuliprc"   # fallback zuliprc (repo root); ZULIP_EMAIL / ZULIP_API_KEY / ZULIP_SITE in ~/.paperbot_env take precedence
+                              # 예비용 zuliprc — ~/.paperbot_env의 ZULIP_EMAIL·ZULIP_API_KEY·ZULIP_SITE가 있으면 그쪽 우선
+  allowed_users: []           # Zulip e-mails or numeric user ids; empty = reject everyone / Zulip 이메일 또는 사용자 id (비면 전부 거절)
+  update_every_s: 5           # min seconds between streaming edits (each edit leaves history in Zulip) / 스트리밍 갱신 최소 간격
+
 library:                      # thread command '@zoterobot <collection>' → Zotero + Google Drive / 스레드 저장 명령
   drive_remote: "gdrive:Zotero"   # rclone "remote:path" = Attanger's file storage folder / Attanger 저장 폴더의 rclone 경로
   link_base: "attachments:"   # Zotero linked-file path prefix (relative to its "Linked Attachment Base Directory") / 링크 첨부 경로 접두어
@@ -20,13 +28,12 @@ library:                      # thread command '@zoterobot <collection>' → Zot
 
 chat:                         # DM chat agent — qwen picks tools (search / read / list); no embedding model / DM 챗봇
   enabled: true
-  llm_url: "http://localhost:11434"   # Ollama native API / Ollama 네이티브 API
-  model: "qwen3.8:27b"        # same as paperbot's llm.model, or two models will sit in VRAM / paperbot과 같은 모델로
-  keep_alive: "10m"           # keep the model loaded this long after the last DM / 마지막 DM 후 모델 유지 시간
+  llm_url: "http://localhost:8090"    # llama-swap (OpenAI-compatible /v1, tools + streaming) / llama-swap 주소
+  model: "qwen3.8:27b"        # same as paperbot's llm.model (= llama-swap model id), or every full-text summary swaps models / paperbot과 같은 모델로
   temperature: 0.5
-  max_output_tokens: 8192     # answer length cap (at ~22 tok/s a full answer takes ~6 min) / 답변 길이 상한
+  max_output_tokens: 8192     # answer length cap (at ~45 tok/s a full answer takes ~3 min) / 답변 길이 상한
   max_tool_steps: 5           # tool-call rounds per question / 질문당 도구 호출 라운드 상한
-  ctx_tokens: 65536           # server context (= OLLAMA_CONTEXT_LENGTH); verified via /api/ps after the first reply / 서버 컨텍스트
+  ctx_tokens: 65536           # server context (= llama-server -c); verified via /props after the first reply / 서버 컨텍스트
   output_reserve_tokens: 3072 # tokens kept aside for the answer when sizing tool text (cap is max_output_tokens) / 답변용 예약
   safety_tokens: 1024         # fixed slack; unmeasured text also gets +10% / 고정 여유 (+미측정분 10%)
   history_max_tokens: 8000    # drop oldest Q/A pairs beyond this / 대화 기억 상한(토큰)

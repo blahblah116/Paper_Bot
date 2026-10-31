@@ -1,9 +1,11 @@
-"""The two request handlers: thread mention → save to Zotero/Drive, DM → chat agent.
-요청 핸들러 둘 — 스레드 멘션(Zotero/Drive 저장), DM(챗봇).
+"""The two request handlers: save command → Zotero/Drive, DM question → chat agent.
+요청 핸들러 둘 — 저장 명령(Zotero/Drive), DM 질문(챗봇). 플랫폼(Slack/Zulip)은 bot 객체가 가린다.
 
-- SaveHandler: '@zoterobot <컬렉션>' → 원글(또는 멘션에 적힌 링크)의 논문을 찾아 library.save_paper.
-- ChatHandler: DM 질문 → GPU 확인 → 자리표시 메시지 → agent.run(진행 상황·부분 답변을 chat.update로 갱신)
+- SaveHandler: Slack 스레드 '@zoterobot <컬렉션>' 또는 Zulip DM '저장 <컬렉션> <링크>' → 원글(또는 명령에 적힌 링크)의
+  논문을 찾아 library.save_paper.
+- ChatHandler: DM 질문 → GPU 확인 → 자리표시 메시지 → agent.run(진행 상황·부분 답변을 update로 갱신)
   → 최종 답 + 참고 논문. 허용된 사용자의 DM은 결과가 어떻든 대화 로그에 남긴다.
+- 답글 표기(볼드·링크·LLM 마크다운 렌더링)는 bot.fmt(ev)로 플랫폼에 맞춘다.
 """
 from __future__ import annotations
 
@@ -12,48 +14,45 @@ import threading
 import time
 from typing import Callable
 
-from paperbot.publisher import md_to_mrkdwn
-
 from .agent import Agent, LLMError
 from .config import Config
 from .drive import DriveError, DriveUploader
 from .gpu import GpuBusy, ensure_gpu
 from .library import save_paper
-from .messages import HELP_WORDS, TITLE_RE, esc, format_result, format_sources, format_usage, parse_command
+from .messages import HELP_WORDS, SLACK, TITLE_RE, esc, format_result, format_sources, format_usage, parse_command
 from .resolver import clean_slack_text, first_ref, resolve
 from .session import RESET_WORDS, ChatLog, Conversations
-from .slackbot import SlackBot
 from .textcache import TextCache
 from .zotero import ZoteroClient, ZoteroError, collection_paths
 
 logger = logging.getLogger(__name__)
 
-_UPDATE_EVERY = 2.5        # DM 답변 스트리밍 시 chat.update 최소 간격(초) — Slack rate limit 여유
 _FINAL_RETRY_WAITS = (1.0, 2.0)   # 최종 답 갱신 실패 시 재시도 전 대기(초) — 2026-10-21 429로 새 메시지가 또 올라간 사고
 _PREVIEW_MAX = 3800        # 실시간 갱신에 보여줄 최대 글자 수 (전체는 완료 시 최종 갱신에서)
 
 
 class SaveHandler:
-    def __init__(self, cfg: Config, bot: SlackBot, zot: ZoteroClient, drive: DriveUploader,
+    def __init__(self, cfg: Config, bot, zot: ZoteroClient, drive: DriveUploader,
                  on_saved: Callable[[], None] | None = None):
-        self.cfg, self.bot, self.zot, self.drive = cfg, bot, zot, drive
+        self.cfg, self.bot, self.zot, self.drive = cfg, bot, zot, drive   # bot: listener.MultiBot(SlackBot/ZulipBot)
         self.on_saved = on_saved
 
-    def usage(self) -> str:
+    def usage(self, fmt=None) -> str:
         try:
             names = sorted(collection_paths(self.zot.collections()).values(), key=str.lower)
-            return format_usage(names, self.drive.remote)
+            return format_usage(names, self.drive.remote, fmt=fmt or SLACK)
         except ZoteroError as e:
-            return format_usage(None, self.drive.remote, error=str(e))
+            return format_usage(None, self.drive.remote, error=str(e), fmt=fmt or SLACK)
 
     def handle(self, ev: dict) -> None:
         if not self.bot.allowed(ev, thread=True):
             return
+        fmt = self.bot.fmt(ev)
         refs, name = parse_command(ev.get("text", ""))
-        logger.info("저장 명령 user=%s collection=%r refs=%s thread=%s",
-                    ev.get("user"), name, refs, ev.get("thread_ts"))
+        logger.info("저장 명령 [%s] user=%s collection=%r refs=%s thread=%s",
+                    fmt.name, ev.get("user"), name, refs, ev.get("thread_ts"))
         if name.lower() in HELP_WORDS:
-            self.bot.reply(ev, self.usage())
+            self.bot.reply(ev, self.usage(fmt))
             return
 
         title_hint = None
@@ -64,7 +63,11 @@ class SaveHandler:
             m = TITLE_RE.search(parent)
             title_hint = m.group(1).strip() if m else None
         if ref is None:
-            self.bot.reply(ev, "논문을 찾지 못했습니다. 논문 스레드 안에서 멘션하거나, arXiv·DOI 링크를 함께 적어주세요.")
+            if fmt.name == "zulip":
+                self.bot.reply(ev, "논문을 찾지 못했습니다. `저장 <컬렉션명> <arXiv·DOI 링크>`처럼 링크를 적거나, "
+                                   "논문 topic의 메시지를 인용(Quote and reply)해서 보내 주세요.")
+            else:
+                self.bot.reply(ev, "논문을 찾지 못했습니다. 논문 스레드 안에서 멘션하거나, arXiv·DOI 링크를 함께 적어주세요.")
             return
 
         self.bot.react(ev, "eyes")
@@ -81,11 +84,11 @@ class SaveHandler:
             self.on_saved()
         self.bot.react(ev, "eyes", remove=True)
         self.bot.react(ev, "white_check_mark")
-        self.bot.reply(ev, format_result(result, self.drive))
+        self.bot.reply(ev, format_result(result, self.drive, fmt))
 
 
 class ChatHandler:
-    def __init__(self, cfg: Config, bot: SlackBot, cache: TextCache | None, agent: Agent | None,
+    def __init__(self, cfg: Config, bot, cache: TextCache | None, agent: Agent | None,
                  on_question: Callable[[], None] | None = None):
         self.cfg, self.bot, self.cache, self.agent = cfg, bot, cache, agent
         self.on_question = on_question
@@ -169,9 +172,11 @@ class ChatHandler:
     def _answer_with_placeholder(self, ev: dict, ch: str, ts: str, question: str, log: dict) -> None:
         status: list[str] = []
         last = [0.0]
+        fmt = self.bot.fmt(ev)
+        every = self.bot.update_every(ev)
 
         def update(text: str, force: bool = False) -> None:
-            if not force and time.time() - last[0] < _UPDATE_EVERY:
+            if not force and time.time() - last[0] < every:
                 return
             last[0] = time.time()
             try:
@@ -184,7 +189,9 @@ class ChatHandler:
             update("\n".join(status) + "\n🧠 답변 작성 중… (논문 전문을 읽으면 1분 안팎)", force=True)
 
         def on_partial(text: str) -> None:
-            shown = md_to_mrkdwn(text)
+            if time.time() - last[0] < every:   # 갱신 간격 전이면 변환도 생략 (토큰마다 마크다운 변환을 하지 않게)
+                return
+            shown = fmt.render(text)
             if len(shown) > _PREVIEW_MAX:
                 update(shown[:_PREVIEW_MAX] + f"\n…(계속 작성 중, {len(shown)}자)")
             else:
@@ -193,15 +200,15 @@ class ChatHandler:
         if self.on_question:
             self.on_question()   # 라이브러리 동기화는 백그라운드 — DM은 현재 캐시로 바로 답한다
         try:
-            res = self.agent.run(question, self.convs.history(ch), on_status, on_partial)
+            res = self.agent.run(question, self.convs.history(ch), on_status, on_partial, math_style=fmt.math_style)
         except LLMError as e:
             logger.error("LLM 실패: %s", e)
             update(f"⚠️ 답변 모델 호출 실패: {esc(str(e))[:300]}", force=True)
             self.chatlog.append({**log, "status": "error", "detail": str(e)})
             return
         answer = res.answer or "(빈 답변 — 다시 물어봐 주세요)"
-        final = md_to_mrkdwn(answer) + format_sources(self.cache, res.papers)
-        self._finalize(ev, ch, ts, final[:39000], last[0])
+        final = fmt.render(answer) + format_sources(self.cache, res.papers, fmt=fmt)
+        self._finalize(ev, ch, ts, final[:fmt.max_chars], last[0])
         self.convs.add(ch, question, answer)
         self.chatlog.append({**log, "status": "ok", "answer": answer, "tools": res.tools,
                              "papers": [{"key": k, "title": (self.cache.get(k).title if self.cache.get(k) else "")}

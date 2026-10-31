@@ -1,311 +1,351 @@
-"""Figure extraction for Slack attachments (caption-anchored).
-Slack 첨부용 대표 figure 추출 — 'Figure N' 캡션을 기준점으로 같은 단의 드로잉·이미지·레이블을 묶어 렌더한다.
+"""Figure/table extraction for Slack/Zulip attachments — DocLayout-YOLO + PyMuPDF.
+Slack/Zulip 첨부용 figure·표 추출 — 레이아웃 검출 모델(DocLayout-YOLO)로 박스를 찾고 PyMuPDF로 크롭 렌더한다.
 
-앞 N페이지에서 캡션을 찾고, 캡션 위 같은 단(column)의 벡터 드로잉·임베디드 이미지·짧은 텍스트(축 레이블·범례)를
-tight bbox로 묶은 뒤 캡션까지 포함해 2x로 렌더한다. 표·정리 박스·옆 단 병합·페이지 헤더는 캡션 기준으로 배제한다.
-캡션이 없는 PDF는 큰 드로잉 클러스터를 figure로 간주하는 폴백을 쓴다.
+앞 N페이지를 렌더해 DocLayout-YOLO(DocStructBench 가중치, CPU)로 figure / figure_caption / table /
+table_caption / table_footnote 박스를 검출하고, 캡션마다 가장 가까운 같은 종류의 본체를 붙여
+(본체 ∪ 캡션 ∪ 표 각주) 영역을 만든 뒤 2x로 크롭한다. 라벨은 캡션 텍스트의 'Figure N'/'Table N'(로마 숫자 포함)을 읽는다.
+figure와 표는 각각 면적 큰 순으로 max_figures / max_tables장을 고르고 캡션 번호 순으로 돌려준다.
 """
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import logging
 import re
+import threading
+import time
+from typing import NamedTuple
 
 import pymupdf
 
 logger = logging.getLogger(__name__)
 
-_FIG_MAX_PAGES = 8             # 앞 N페이지에서 figure 후보 탐색
-_FIG_MAX_BYTES = 4_000_000     # figure 하나당 PNG 크기 제한
-_FIG_MIN_AREA = 120_000        # 이보다 작은 임베디드 이미지(로고 등)는 무시
-_FIG_MAX_ASPECT = 6.0          # 가로세로비가 극단적인 것(배너/구분선) 제외
-_FIG_MIN_COLORS = 1000         # 색 다양성 하한 — 실측: 진짜 figure 1.2만+, 장식 조각 50~200
-_FIG_MIN_DENSITY = 0.2         # 래스터 PNG bytes/px 하한 — 그라디언트 장식(0.13)과 실물(0.57+) 분리
-_ZOOM = pymupdf.Matrix(2, 2)   # 렌더 해상도 (2x ≈ 144dpi)
-_FIG_HEADER_H = 50.0           # 페이지 상단 이 높이(pt) 안은 헤더로 보고 figure에서 제외
-_FIG_ELEM_GAP = 18.0           # figure 요소(서브플롯 등) 사이 허용 세로 간격(pt) — 표·헤더와 분리
-_FIG_CLUSTER_TOL = 6.0         # 드로잉 클러스터 병합 허용 오차(pt) — 크면 옆 단 figure까지 붙는다
-_FIG_TEXT_MARGIN = 12.0        # 이 거리(pt) 안의 텍스트 블록(축 레이블·범례)은 figure 영역에 합침
-_FIG_TEXT_MAX_H = 45.0         # 이보다 높은 텍스트 블록은 본문 단락으로 보고 합치지 않음
-_CAPTION_FIG_RE = re.compile(r"^\s*(?:Figure|Fig\.?)\s*\d+", re.IGNORECASE)
-_CAPTION_TAB_RE = re.compile(r"^\s*Table\s*\d+", re.IGNORECASE)
+_MAX_PAGES = 10                 # 앞 N페이지 탐색 (결과표가 6~9페이지에 몰리는 일이 많다)
+_MAX_BYTES = 4_000_000          # 크롭 PNG 하나당 크기 상한
+_ZOOM = pymupdf.Matrix(2, 2)    # 크롭 렌더 해상도 (2x ≈ 144dpi)
+_DET_LONG_SIDE = 1024           # 검출용 렌더: 긴 변을 모델 입력 크기(imgsz)에 맞춘다 (내부 리사이즈 손실 없음)
+_CONF = 0.25                    # 검출 신뢰도 하한
+_DEVICE = "cpu"                 # GPU는 요약 모델 전용 — 임베딩 필터와 같은 원칙 (페이지당 ≈0.5s)
+_CAPTION_GAP = 60.0             # 본체-캡션 세로 간격 상한(pt)
+_FOOTNOTE_GAP = 20.0            # 표 본체-각주 세로 간격 상한(pt)
+_MIN_H_OVERLAP = 0.3            # 본체-캡션 가로 겹침 비율 하한 (좁은 쪽 폭 기준)
+_UNCAPTIONED_MIN_AREA = 0.08    # 캡션 없는 figure는 페이지 면적의 8% 이상일 때만 (장식·로고 배제). 캡션 없는 표는 버림
+_PAD = (-4.0, -3.0, 4.0, 3.0)   # 크롭 여백(pt)
+
+_HF_REPO = "juliozhao/DocLayout-YOLO-DocStructBench"
+_HF_FILE = "doclayout_yolo_docstructbench_imgsz1024.pt"   # 약 41MB, ~/.cache/huggingface 에 캐시
+
+_BODY_KIND = {"figure": "figure", "table": "table"}
+_CAPTION_KIND = {"figure_caption": "figure", "table_caption": "table"}
+# 캡션 번호: 아라비아 숫자(Figure 3, Fig. 3a) 또는 로마 숫자(IEEE 형식 'TABLE IV' — 2026-10-23 실측 arXiv 2606.10166).
+# 로마 숫자는 대문자만, 뒤가 단어 경계일 때만 ('Table In …' 같은 문장은 제외).
+_NUM = r"(\d+|[IVXLC]{1,7}\b)"
+_LABEL_RE = re.compile(r"\b(?i:(Figure|Fig\.?|Table))\s*" + _NUM)
+_CAPTION_START_RE = re.compile(r"^\s*(?i:(Figure|Fig\.?|Table))\s*" + _NUM)   # 텍스트 블록 폴백용
+_ROMAN = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100}
+_LABEL_WORD = {"figure": "Figure", "table": "Table"}
 
 
-def _raster_candidates(doc, npages: int) -> list[tuple[int, int, float, str, object]]:
-    """임베디드 래스터 이미지 후보: (픽셀면적, 페이지, y위치, 'raster', (xref, smask)).
-
-    로고·배너·다이어그램 장식 조각을 걸러내기 위해 크기/가로세로비에 더해
-    색 다양성(color_count)을 본다 — 단색 계열 장식은 수십~수백 색에 그친다.
-    """
-    out = []
-    seen_xref: set[int] = set()
-    for pno in range(npages):
-        page = doc[pno]
-        for img in page.get_images(full=True):
-            xref, smask = img[0], img[1]
-            if xref in seen_xref:
-                continue
-            seen_xref.add(xref)
-            try:
-                pix = pymupdf.Pixmap(doc, xref)
-                w, h = pix.width, pix.height
-            except Exception:  # noqa: BLE001 — 깨진 이미지 스킵
-                continue
-            if w * h < _FIG_MIN_AREA or max(w, h) / max(1, min(w, h)) > _FIG_MAX_ASPECT:
-                continue
-            try:
-                if pix.color_count() < _FIG_MIN_COLORS:  # 장식 요소 컷
-                    continue
-            except Exception:  # noqa: BLE001 — 색 카운트 실패 시 필터 생략
-                pass
-            rects = page.get_image_rects(xref)
-            y0 = rects[0].y0 if rects else 0.0
-            out.append((w * h, pno, y0, "raster", (xref, smask)))
-    return out
+def _roman_to_int(s: str) -> int:
+    total = 0
+    for i, ch in enumerate(s):
+        v = _ROMAN[ch]
+        total += -v if i + 1 < len(s) and _ROMAN[s[i + 1]] > v else v
+    return total
 
 
-def _raster_inside(doc, cand, rect: pymupdf.Rect) -> bool:
-    """래스터 후보의 배치 영역이 rect 안에 (거의) 들어가는가."""
-    _, pno, _, _, (xref, _) = cand
-    for ir in doc[pno].get_image_rects(xref):
-        inter = ir & rect
-        if not inter.is_empty and inter.width * inter.height >= 0.8 * ir.width * ir.height:
-            return True
-    return False
+def _label_num(label: str | None) -> int:
+    """'Table 3' → 3, 'Table IV' → 4, 번호 없음 → 아주 큰 수 (정렬 키)."""
+    parts = (label or "").split()
+    num = parts[1] if len(parts) >= 2 else ""
+    if num.isdigit():
+        return int(num)
+    if num and all(ch in _ROMAN for ch in num):
+        return _roman_to_int(num)
+    m = re.search(r"(\d+)", label or "")
+    return int(m.group(1)) if m else 1_000_000
 
 
-def _text_blocks(page) -> list[tuple[pymupdf.Rect, str]]:
-    """페이지의 텍스트 블록 (bbox, 텍스트). 이미지 블록은 제외."""
+def label_slug(label: str) -> str:
+    """첨부 파일명용 라벨: 'Figure 3' → 'figure_3', 'Table 1 (2)' → 'table_1_2'."""
+    return re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_")
+
+
+class _Cand(NamedTuple):
+    """크롭 후보 하나 (선별 전)."""
+    area: int
+    page: int
+    y0: float
+    kind: str              # 'figure' | 'table'
+    label: str | None      # 캡션에서 읽은 'Figure 3' / 'Table IV', 못 읽으면 None
+    rect: pymupdf.Rect
+
+
+@dataclasses.dataclass(frozen=True)
+class Figure:
+    """첨부 한 장: kind는 'figure' | 'table' | 'page'(폴백: 1페이지 렌더), label은 'Figure 3' / 'Table 1' / 'Page 1'."""
+    kind: str
+    label: str
+    png: bytes
+
+
+# ---------------------------------------------------------------- 모델
+
+_model = None
+_model_lock = threading.Lock()
+
+
+def _get_model():
+    """DocLayout-YOLO 모델 지연 로드(프로세스당 1회, 약 6초). 가중치는 Hugging Face Hub 캐시."""
+    global _model
+    with _model_lock:
+        if _model is None:
+            from doclayout_yolo import YOLOv10
+            from huggingface_hub import hf_hub_download
+            t0 = time.monotonic()
+            try:   # 캐시에 있으면 Hub에 다시 묻지 않는다 (실행마다 0.3~1s, Hub 장애 땐 10s 타임아웃 절약)
+                path = hf_hub_download(repo_id=_HF_REPO, filename=_HF_FILE, local_files_only=True)
+            except Exception:  # noqa: BLE001 — 캐시 없음(첫 실행) → 내려받기
+                path = hf_hub_download(repo_id=_HF_REPO, filename=_HF_FILE)
+            _model = YOLOv10(path)
+            logger.info("DocLayout-YOLO 로드 완료 (%s, %.1fs)", _DEVICE, time.monotonic() - t0)
+        return _model
+
+
+def _detect(model, page) -> tuple[list[tuple[str, pymupdf.Rect]], list[tuple[str, pymupdf.Rect]], list[pymupdf.Rect]]:
+    """페이지 하나를 렌더해 검출. (본체[(kind, rect)], 캡션[(kind, rect)], 표 각주[rect]) — 좌표는 PDF pt."""
+    from PIL import Image
+    pr = page.rect
+    z = _DET_LONG_SIDE / max(pr.width, pr.height)
+    pix = page.get_pixmap(matrix=pymupdf.Matrix(z, z))
+    img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+    with _model_lock:  # predict는 스레드 안전이 보장되지 않음
+        res = model.predict(img, imgsz=_DET_LONG_SIDE, conf=_CONF, device=_DEVICE, verbose=False)[0]
+    bodies, captions, footnotes = [], [], []
+    for xyxy, cls in zip(res.boxes.xyxy.tolist(), res.boxes.cls.tolist()):
+        name = res.names[int(cls)]
+        x0, y0, x1, y1 = (v / z for v in xyxy)
+        r = pymupdf.Rect(x0, y0, x1, y1) & pr
+        if r.is_empty:
+            continue
+        if name in _BODY_KIND:
+            bodies.append((_BODY_KIND[name], r))
+        elif name in _CAPTION_KIND:
+            captions.append((_CAPTION_KIND[name], r))
+        elif name == "table_footnote":
+            footnotes.append(r)
+    return bodies, captions, footnotes
+
+
+# ---------------------------------------------------------------- 묶기
+
+def _h_overlap(a: pymupdf.Rect, b: pymupdf.Rect) -> float:
+    w = min(a.x1, b.x1) - max(a.x0, b.x0)
+    return w / max(1.0, min(a.width, b.width)) if w > 0 else 0.0
+
+
+def _v_gap(a: pymupdf.Rect, b: pymupdf.Rect) -> float:
+    """세로 간격(pt). 겹치면 0."""
+    return max(0.0, a.y0 - b.y1, b.y0 - a.y1)
+
+
+def _side(body: pymupdf.Rect, cap: pymupdf.Rect) -> int:
+    """본체가 캡션의 위(-1)/아래(+1) 어느 쪽인가."""
+    return -1 if (body.y0 + body.y1) / 2.0 < (cap.y0 + cap.y1) / 2.0 else 1
+
+
+def _kind_of(word: str) -> str:
+    """캡션 첫 단어('Figure'/'Fig.'/'TABLE') → 'figure' | 'table'."""
+    return "figure" if word.lower().startswith("fig") else "table"
+
+
+def _pair_gap(cap: pymupdf.Rect, body: pymupdf.Rect) -> float | None:
+    """캡션과 본체가 짝이 될 수 있으면 세로 간격(pt), 아니면 None — 가로로 충분히 겹치고 세로로 가까워야 한다."""
+    if _h_overlap(cap, body) < _MIN_H_OVERLAP:
+        return None
+    gap = _v_gap(cap, body)
+    return gap if gap <= _CAPTION_GAP else None
+
+
+def _caption_label(page, cap: pymupdf.Rect, kind: str) -> str | None:
+    """캡션 영역의 텍스트에서 'Figure N' / 'Table N'을 읽는다. 못 읽으면 None."""
+    try:
+        txt = page.get_text("text", clip=cap + (-2.0, -2.0, 2.0, 2.0)) or ""
+    except Exception:  # noqa: BLE001
+        return None
+    for m in _LABEL_RE.finditer(txt):
+        if _kind_of(m.group(1)) == kind:
+            return f"{_LABEL_WORD[kind]} {m.group(2)}"
+    return None
+
+
+def _text_caption_blocks(page) -> list[tuple[str, pymupdf.Rect]]:
+    """'Figure N' / 'Table N'으로 시작하는 텍스트 블록 → (kind, rect). 모델이 캡션을 놓쳤을 때의 폴백."""
     out = []
     try:
         for b in page.get_text("blocks"):
-            if len(b) >= 7 and b[6] != 0:  # block_type 1 = image
+            if len(b) >= 7 and b[6] != 0:  # 이미지 블록 제외
+                continue
+            m = _CAPTION_START_RE.match(b[4] if len(b) > 4 else "")
+            if not m:
                 continue
             r = pymupdf.Rect(b[:4])
             if not r.is_empty:
-                out.append((r, b[4] if len(b) > 4 else ""))
+                out.append((_kind_of(m.group(1)), r))
     except Exception:  # noqa: BLE001
         pass
     return out
 
 
-def _is_paragraph(r: pymupdf.Rect, txt: str, page_w: float) -> bool:
-    """본문 단락처럼 보이는 텍스트 블록인가 (figure 안의 짧은 레이블과 구분)."""
-    lines = txt.count("\n") + 1
-    # 폭이 단의 절반도 안 되는 블록은 아무리 높아도 단락이 아니다 (y축 눈금 레이블 열 등).
-    # 여러 줄 넓은 블록이라도 높이가 세 줄 미만이면 한 줄에 나열된 레이블 묶음이다.
-    if r.width <= 0.3 * page_w:
-        return False
-    return r.height > _FIG_TEXT_MAX_H or (lines >= 4 and r.height >= 28.0)
+def _group_page(page, bodies, captions, footnotes) -> list[tuple[str, str | None, pymupdf.Rect]]:
+    """캡션마다 가장 가까운 같은 종류의 본체를 붙인다 (간격 오름차순 그리디).
 
-
-def _caption_candidates(doc, npages: int) -> list[tuple[int, int, float, str, object]]:
-    """'Figure N' 캡션을 기준점으로 figure 영역을 잡는다 (주 경로).
-
-    캡션 바로 위, 같은 단(캡션의 가로 범위와 겹치는 영역)에서 본문 단락이나
-    다른 캡션을 만나기 전까지를 figure 본체로 보고, 그 안의 드로잉·이미지·짧은
-    텍스트(레이블)의 합집합을 tight bbox로 삼은 뒤 캡션을 붙인다.
-    - 텍스트가 드로잉 bbox 밖으로 밀려 잘리는 문제 → 영역 안 텍스트를 합쳐 해결
-    - 표·정리 박스가 figure로 잡히는 문제 → Figure 캡션이 있는 것만 후보
-    - 옆 단 figure와 병합되는 문제 → 캡션의 가로 범위로 단을 구분
-    후보: (점수, 페이지, y위치, 'region', rect)
+    - 본체는 캡션 하나에만 속한다. 한 캡션에 여러 본체가 붙으면(서브패널) 합치되, 첫 본체와
+      같은 쪽(캡션 위/아래)에 있는 것만 — 캡션 건너편의 다음 figure가 딸려 오지 않게.
+    - 표에는 바로 아래 각주(table_footnote)를 붙인다.
+    - 모델이 캡션을 놓친 본체는 'Figure N'/'Table N' 텍스트 블록이 옆에 있으면 그것을 캡션으로 쓴다.
+    - 그래도 캡션 없는 figure는 충분히 클 때만 단독 후보, 캡션 없는 표는 버린다(알고리즘 박스 오검출 방지).
+    반환: (kind, label|None, rect)
     """
-    out = []
-    for pno in range(npages):
-        page = doc[pno]
-        prect = page.rect
-        pw, parea = prect.width, prect.width * prect.height
-        blocks = _text_blocks(page)
-        captions = [(r, t) for r, t in blocks if _CAPTION_FIG_RE.match(t)]
-        if not captions:
+    pairs = []  # (gap, caption_idx, body_idx)
+    for ci, (ck, cr) in enumerate(captions):
+        for bi, (bk, br) in enumerate(bodies):
+            gap = _pair_gap(cr, br) if bk == ck else None
+            if gap is not None:
+                pairs.append((gap, ci, bi))
+    pairs.sort()
+    cap_bodies: dict[int, list[int]] = {}
+    taken: set[int] = set()
+    for _, ci, bi in pairs:
+        if bi in taken:
             continue
-        try:
-            drawings = page.cluster_drawings(x_tolerance=_FIG_CLUSTER_TOL, y_tolerance=_FIG_CLUSTER_TOL)
-        except Exception:  # noqa: BLE001
-            drawings = []
-        images = []
-        for img in page.get_images(full=True):
-            for ir in page.get_image_rects(img[0]):
-                images.append(ir)
-        stoppers = [(r, t) for r, t in blocks
-                    if _is_paragraph(r, t, pw) or _CAPTION_FIG_RE.match(t) or _CAPTION_TAB_RE.match(t)]
+        have = cap_bodies.get(ci)
+        if have and _side(bodies[bi][1], captions[ci][1]) != _side(bodies[have[0]][1], captions[ci][1]):
+            continue
+        taken.add(bi)
+        cap_bodies.setdefault(ci, []).append(bi)
 
-        for cap, _ in captions:
-            # 캡션 위쪽으로 올라가며 같은 단의 첫 '정지 블록'(단락/다른 캡션) 아래를 상단으로.
-            top = prect.y0 + _FIG_HEADER_H  # 페이지 헤더(러닝 타이틀) 영역은 제외
-            for r, _ in stoppers:
-                if r.y1 <= cap.y0 + 2.0 and r.x1 > cap.x0 and r.x0 < cap.x1 and r is not cap:
-                    top = max(top, r.y1)
-            region = pymupdf.Rect(cap.x0, top, cap.x1, cap.y0)
-            if region.is_empty or region.height < 30.0:
-                continue
-            # 영역과 겹치는 드로잉·이미지·짧은 텍스트로 tight bbox 구성.
-            # (figure가 캡션보다 넓은 경우를 위해 가로는 겹침만 요구)
-            # 캡션이 단 폭(페이지의 55% 미만)이고 한쪽 단에 치우쳐 있으면 그 단 안으로
-            # 요소를 잘라 옆 단 figure와 분리. 짧지만 페이지 중앙에 놓인 캡션은 전폭 figure.
-            mid = prect.x0 + pw / 2.0
-            if cap.width < 0.55 * pw and abs((cap.x0 + cap.x1) / 2.0 - mid) > 0.08 * pw:
-                colbox = pymupdf.Rect(prect.x0, top, mid, cap.y0 + 2.0) if (cap.x0 + cap.x1) / 2.0 < mid \
-                    else pymupdf.Rect(mid, top, prect.x1, cap.y0 + 2.0)
-            else:
-                colbox = pymupdf.Rect(prect.x0, top, prect.x1, cap.y0 + 2.0)
-            # 텍스트 병합용 상자: wrapfigure처럼 옆 단락이 figure 제목과 세로로 겹치는 경우를
-            # 위해 위로 12pt 여유를 둔다 (단락 자체는 stopper라 병합되지 않음).
-            textbox = pymupdf.Rect(colbox.x0, max(top - 12.0, prect.y0 + _FIG_HEADER_H), colbox.x1, colbox.y1)
-            elems = []
-            for r in list(drawings) + images:
-                if min(r.width, r.height) < 3.0:
-                    continue  # 가로줄/구분선(페이지 헤더 밑줄 등)
-                r = pymupdf.Rect(r) & colbox
-                if not r.is_empty and r.intersects(region):
-                    elems.append(r)
-            if not elems:
-                continue  # 캡션만 있고 그림 요소가 없음 (그림이 다음 페이지 등)
-            # 캡션에 가장 가까운 요소에서 시작해 세로 간격이 좁은 요소만 이어 붙인다.
-            # 같은 단 위쪽의 표(가로줄 드로잉)·페이지 헤더는 간격이 넓어 떨어져 나간다.
-            elems.sort(key=lambda r: r.y1, reverse=True)
-            tight = elems[0]
-            rest = elems[1:]
-            while rest:
-                near = [r for r in rest if r.intersects(tight) or 0 <= tight.y0 - r.y1 <= _FIG_ELEM_GAP]
-                if not near:
-                    break
-                for r in near:
-                    tight |= r
-                rest = [r for r in rest if r not in near]
-            for r, t in blocks:
-                if _is_paragraph(r, t, pw) or _CAPTION_FIG_RE.match(t) or _CAPTION_TAB_RE.match(t):
-                    continue
-                probe = tight + (-_FIG_TEXT_MARGIN, -_FIG_TEXT_MARGIN, _FIG_TEXT_MARGIN, _FIG_TEXT_MARGIN)
-                inside = r & textbox
-                # 단락 바로 아래 붙은 플롯 제목은 블록 bbox가 단락과 살짝 겹치므로 60% 포함이면 허용.
-                # 단, 헤더 영역에 걸친 블록(러닝 타이틀)은 제외.
-                if r.y0 < prect.y0 + _FIG_HEADER_H:
-                    continue
-                if not (probe.intersects(r) and not inside.is_empty and inside.height >= 0.6 * r.height):
-                    continue
-                if r.y1 <= tight.y0 + 1.0:
-                    # figure 위쪽 텍스트는 (1) 바싹 붙은 것(행 레이블), (2) figure 중앙 정렬(플롯 제목),
-                    # (3) 어느 한 요소(서브패널) 바로 위 그 요소 범위 안에 놓인 것((a)(b) 라벨)만.
-                    # 단 왼쪽 끝에 붙어 있고 간격이 있는 짧은 블록은 앞 단락의 마지막 줄이다.
-                    cx = (r.x0 + r.x1) / 2.0
-                    centered = abs(cx - (tight.x0 + tight.x1) / 2.0) <= 0.15 * tight.width
-                    over_elem = any(r.x1 > e.x0 and r.x0 < e.x1 and 0 <= e.y0 - r.y1 <= 12.0 for e in elems)
-                    if tight.y0 - r.y1 > 6.0 and not centered and not over_elem:
-                        continue
-                tight |= r
-            rect = (tight | cap) + (-4.0, -2.0, 4.0, 2.0)
-            # 위로는 stopper(단락) 하단, 아래로는 캡션 다음 단락 상단을 넘지 않게 — 본문이 비치지 않도록.
-            rect.y0 = max(rect.y0, min(top, tight.y0))
-            below = [r.y0 for r, _ in stoppers if r.y0 >= cap.y1 - 2.0 and r.x1 > cap.x0 and r.x0 < cap.x1]
-            if below:
-                rect.y1 = min(rect.y1, max(min(below), cap.y1))
-            rect &= prect
-            if rect.width * rect.height < 0.03 * parea:
-                continue
-            out.append((int(rect.width * 2 * rect.height * 2), pno, rect.y0, "region", rect))
+    # 모델이 캡션을 놓친 본체: 같은 종류의 'Figure N'/'Table N'으로 시작하는 텍스트 블록이 바로 옆에 있으면 캡션으로 삼는다
+    # (실측: 한 페이지에 표 3개면 캡션을 1개만 잡는 일이 있음).
+    text_caps = _text_caption_blocks(page) if len(taken) < len(bodies) else []   # 다 짝지었으면 텍스트 파싱 생략
+    for bi, (bk, br) in enumerate(bodies):
+        if bi in taken:
+            continue
+        best = None
+        for tk, tr in text_caps:
+            gap = _pair_gap(tr, br) if tk == bk else None
+            if gap is not None and (best is None or gap < best[0]):
+                best = (gap, tr)
+        if best is not None:
+            captions.append((bk, best[1]))
+            cap_bodies[len(captions) - 1] = [bi]
+            taken.add(bi)
+
+    pr = page.rect
+    out: list[tuple[str, str | None, pymupdf.Rect]] = []
+    for ci, idxs in cap_bodies.items():
+        kind, cap = captions[ci]
+        rect = pymupdf.Rect(cap)
+        for bi in idxs:
+            rect |= bodies[bi][1]
+        if kind == "table":
+            body = pymupdf.Rect(bodies[idxs[0]][1])
+            for bi in idxs[1:]:
+                body |= bodies[bi][1]
+            for fr in footnotes:
+                if fr.y0 >= body.y1 - 2.0 and _v_gap(fr, body) <= _FOOTNOTE_GAP and _h_overlap(fr, body) >= _MIN_H_OVERLAP:
+                    rect |= fr
+        out.append((kind, _caption_label(page, cap, kind), rect))
+    parea = pr.width * pr.height
+    for bi, (kind, br) in enumerate(bodies):
+        if bi in taken or kind != "figure":
+            continue
+        if br.width * br.height >= _UNCAPTIONED_MIN_AREA * parea:
+            out.append((kind, None, pymupdf.Rect(br)))
     return out
 
 
-def _vector_candidates(doc, npages: int) -> list[tuple[int, int, float, str, object]]:
-    """캡션 없는 PDF용 폴백 — 큰 드로잉 클러스터를 figure로 간주.
+# ---------------------------------------------------------------- 추출
 
-    표·정리 박스도 잡히기 때문에 _caption_candidates가 하나도 없을 때만 쓴다.
-    """
-    if not hasattr(pymupdf.Page, "cluster_drawings"):
-        return []
-    out = []
-    for pno in range(npages):
-        page = doc[pno]
-        parea = page.rect.width * page.rect.height
-        try:
-            clusters = page.cluster_drawings(x_tolerance=_FIG_CLUSTER_TOL, y_tolerance=_FIG_CLUSTER_TOL)
-        except Exception:  # noqa: BLE001 — 복잡한 페이지에서 실패 가능
-            continue
-        big = [r for r in clusters if 0.12 * parea <= r.width * r.height <= 0.85 * parea]
-        big.sort(key=lambda r: r.width * r.height, reverse=True)
-        for r in big[:2]:  # 페이지당 최대 2개
-            out.append((int(r.width * 2 * r.height * 2), pno, r.y0, "vector", pymupdf.Rect(r) & page.rect))
-    return out
-
-
-def _render_candidate(doc, cand) -> bytes | None:
-    _, pno, _, kind, payload = cand
-    try:
-        if kind == "raster":
-            xref, smask = payload
-            pix = pymupdf.Pixmap(doc, xref)
-            if pix.colorspace is None or pix.colorspace.n > 3:
-                pix = pymupdf.Pixmap(pymupdf.csRGB, pix)  # CMYK 등 → RGB
-            if smask:  # 투명도(SMask) 적용 — 미적용 시 검은 배경 아티팩트
-                try:
-                    pix = pymupdf.Pixmap(pix, pymupdf.Pixmap(doc, smask))
-                except Exception:  # noqa: BLE001 — 마스크 불일치 시 원본 사용
-                    pass
-            data = pix.tobytes("png")
-            # 그라디언트/단순 도형 장식은 압축 밀도가 극단적으로 낮다 (실측 0.13 vs 0.57+).
-            if len(data) / max(1, pix.width * pix.height) < _FIG_MIN_DENSITY:
-                return None
-        elif kind == "region":  # 캡션 기준 영역 — 여백·경계 처리가 이미 끝난 rect
-            pix = doc[pno].get_pixmap(matrix=_ZOOM, clip=payload)
-            data = pix.tobytes("png")
-        else:
-            rect = (payload + (-4, -2, 4, 2)) & doc[pno].rect  # 여백 살짝
-            pix = doc[pno].get_pixmap(matrix=_ZOOM, clip=rect)
-            data = pix.tobytes("png")
-        return data if 0 < len(data) <= _FIG_MAX_BYTES else None
-    except Exception:  # noqa: BLE001
+def _render(page, rect: pymupdf.Rect) -> bytes | None:
+    rect = (rect + _PAD) & page.rect
+    if rect.is_empty:
         return None
+    data = page.get_pixmap(matrix=_ZOOM, clip=rect).tobytes("png")
+    return data if 0 < len(data) <= _MAX_BYTES else None
 
 
-def extract_figures(pdf_path: str, max_pages: int = _FIG_MAX_PAGES, max_figures: int = 3) -> list[bytes]:
-    """대표 figure PNG 최대 max_figures개 추출 (휴리스틱).
+def _choose(cands: list[_Cand], limit: int, render, seen_digest: set[str]) -> list[tuple[_Cand, bytes]]:
+    """후보 중 면적 큰 순으로 limit장을 고르고, 붙이는 순서는 캡션 번호 순으로 돌려준다.
 
-    앞 max_pages 페이지에서 'Figure N' 캡션 기준 영역(_caption_candidates)을 주 후보로,
-    캡션 영역에 포함되지 않은 임베디드 래스터 이미지를 보조 후보로 모아
-    면적 상위 max_figures개를 고른 뒤 읽기 순서(페이지→세로 위치)로 반환.
-    캡션을 하나도 못 찾은 PDF는 큰 드로잉 클러스터(_vector_candidates)로 폴백.
-    아무것도 못 찾으면 1페이지 렌더 1장으로 폴백. 실패는 치명적이지 않음.
+    render(cand) → PNG bytes | None. 렌더 실패(None)나 이미 고른 것과 같은 그림(PNG md5가 seen_digest에 있음)이면
+    그다음으로 큰 후보를 쓴다. 번호를 못 읽은 후보는 번호 있는 것들 뒤에 페이지·세로 위치 순으로 둔다.
     """
-    if max_figures <= 0:
+    chosen: list[tuple[_Cand, bytes]] = []
+    if limit <= 0:
+        return chosen
+    for c in sorted(cands, key=lambda c: c.area, reverse=True):
+        if len(chosen) >= limit:
+            break
+        data = render(c)
+        if data is None:
+            continue
+        digest = hashlib.md5(data).hexdigest()
+        if digest in seen_digest:
+            continue
+        seen_digest.add(digest)
+        chosen.append((c, data))
+    # 캡션 번호 순(Figure 1, 2, …) — 2단 레이아웃에선 페이지 위치 순이 번호와 어긋난다(실측: Table 2→1→3).
+    chosen.sort(key=lambda cd: (_label_num(cd[0].label), cd[0].page, cd[0].y0))
+    return chosen
+
+
+def extract_figures(pdf_path: str, max_pages: int = _MAX_PAGES,
+                    max_figures: int = 3, max_tables: int = 3) -> list[Figure]:
+    """대표 figure 최대 max_figures장 + 표 최대 max_tables장 (캡션 포함 크롭).
+
+    앞 max_pages 페이지에서 레이아웃 검출 → 캡션 묶기 → 종류별로 면적 큰 순 선별(_choose) → 2x 크롭.
+    figure들이 먼저, 표들이 뒤에 온다(각각 캡션 번호 순). 같은 라벨이 겹치면 ' (2)'를 붙인다.
+    아무것도 못 찾으면 1페이지 렌더 1장(kind='page')으로 폴백. 모델 로드·검출 실패는 경고만 남기고 빈 목록.
+    """
+    if max_figures <= 0 and max_tables <= 0:
         return []
     try:
+        model = _get_model()
+    except Exception as e:  # noqa: BLE001 — 모델 없이도 발행은 계속 (텍스트만)
+        logger.warning("레이아웃 모델 로드 실패(figure 없이 발행): %s", e)
+        return []
+    try:
+        t0 = time.monotonic()
         with pymupdf.open(pdf_path) as doc:
             npages = min(max_pages, len(doc))
-            cap_cands = _caption_candidates(doc, npages)
-            rasters = _raster_candidates(doc, npages)
-            if cap_cands:
-                # 캡션 영역 렌더에 이미 포함되는 임베디드 이미지는 중복이므로 제외.
-                covered = [(c[1], c[4]) for c in cap_cands]
-                rasters = [r for r in rasters
-                           if not any(pno == r[1] and _raster_inside(doc, r, rect) for pno, rect in covered)]
-                cands = cap_cands + rasters
-            else:
-                cands = rasters + _vector_candidates(doc, npages)
-            cands.sort(key=lambda c: c[0], reverse=True)   # 면적 큰 순으로 선별
-            picked = cands[: max_figures * 2]              # 렌더 실패/중복 대비 여유 선별
-            picked.sort(key=lambda c: (c[1], c[2]))        # 읽기 순서로 정렬
+            cands: list[_Cand] = []
+            for pno in range(npages):
+                page = doc[pno]
+                bodies, captions, footnotes = _detect(model, page)
+                for kind, label, rect in _group_page(page, bodies, captions, footnotes):
+                    cands.append(_Cand(int(rect.width * rect.height), pno, rect.y0, kind, label, rect))
 
-            figures: list[bytes] = []
+            figures: list[Figure] = []
             seen_digest: set[str] = set()
-            for cand in picked:
-                if len(figures) >= max_figures:
-                    break
-                data = _render_candidate(doc, cand)
-                if data is None:
-                    continue
-                digest = hashlib.md5(data).hexdigest()
-                if digest in seen_digest:                  # 반복 삽입 이미지 dedup
-                    continue
-                seen_digest.add(digest)
-                figures.append(data)
-
+            seen_label: dict[str, int] = {}
+            for kind, limit in (("figure", max_figures), ("table", max_tables)):
+                group = [c for c in cands if c.kind == kind]
+                for c, data in _choose(group, limit, lambda c: _render(doc[c.page], c.rect), seen_digest):
+                    label = c.label or _LABEL_WORD[kind]
+                    seen_label[label] = seen_label.get(label, 0) + 1
+                    if seen_label[label] > 1:
+                        label = f"{label} ({seen_label[label]})"
+                    figures.append(Figure(kind, label, data))
+            logger.debug("레이아웃 추출 %s: 후보 figure %d·table %d → %d장, %.1fs", pdf_path,
+                         sum(1 for c in cands if c.kind == "figure"), sum(1 for c in cands if c.kind == "table"),
+                         len(figures), time.monotonic() - t0)
             if figures:
                 return figures
 
             # 폴백: 1페이지 렌더 (논문 카드 역할)
             data = doc[0].get_pixmap(matrix=_ZOOM).tobytes("png")
-            return [data] if 0 < len(data) <= _FIG_MAX_BYTES else []
+            return [Figure("page", "Page 1", data)] if 0 < len(data) <= _MAX_BYTES else []
     except Exception as e:  # noqa: BLE001
         logger.warning("figure 추출 실패(텍스트만 발행): %s", e)
         return []

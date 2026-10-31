@@ -1,28 +1,20 @@
 """Slack publishing: channel message + thread summary (+ figure attachments).
 Slack 발행 — 채널 메인 메시지(제목·메타·링크·한 줄 요약) + 스레드 댓글(전체 요약) + figure 첨부.
 
-- SlackPublisher: 실제 전송. 토큰은 환경변수 SLACK_BOT_TOKEN, 채널은 config(slack.channel / topic.channel).
-- DryRunPublisher: 전송 없이 같은 레이아웃을 stdout에 출력.
-- 새 백엔드를 붙이려면 Publisher를 구현하고 make_publisher에 연결한다.
+토큰은 환경변수 SLACK_BOT_TOKEN, 채널은 config(slack.channel / topic.channel). 429는 Retry-After를 존중해 재시도.
 """
 from __future__ import annotations
 
-import abc
 import logging
 import os
-import re
 import time
 
-from .config import Config
-from .models import Paper
+from ..config import Config
+from ..figures import Figure
+from ..models import Paper
+from .base import _MD_BOLD_RE, _MD_HEADING_RE, PublishConfigError, Publisher, _format_meta, extract_one_liner, figure_filename
 
 logger = logging.getLogger(__name__)
-
-
-class PublishConfigError(Exception):
-    """전송 '설정' 문제(채널/토큰/권한). 논문별 재시도가 무의미하므로
-    개별 논문을 failed로 소모하지 않고 실행 전체를 중단해야 한다."""
-
 
 # 재시도해도 소용없는 Slack 설정 오류들.
 _SLACK_CONFIG_ERRORS = {
@@ -34,48 +26,6 @@ _SLACK_CONFIG_ERRORS = {
     "missing_scope",       # chat:write 스코프 누락
     "restricted_action",
 }
-
-# 요약 마크다운에서 "### 1. 한 줄 요약" 섹션 본문만 추출 (Slack 메인 메시지용).
-_ONE_LINER_RE = re.compile(r"###\s*1\.\s*한\s*줄\s*요약\s*\n+(.*?)(?=\n###|\Z)", re.DOTALL)
-# 우리 요약 형식의 마크다운 → Slack mrkdwn 변환용.
-_MD_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
-_MD_HEADING_RE = re.compile(r"^#{1,6}\s*(.+)$", re.MULTILINE)
-
-
-# ---------------------------------------------------------------- 메시지 포맷
-
-def _format_authors(authors: list[str]) -> str:
-    if not authors:
-        return "저자 미상"
-    head = authors[:3]
-    s = ", ".join(head)
-    if len(authors) > 3:
-        s += ", et al."
-    return s
-
-
-def _format_meta(paper: Paper, abstract_only: bool) -> str:
-    venue = paper.venue or "arXiv preprint"
-    meta_parts = [_format_authors(paper.authors), f"{venue} {paper.year or ''}".strip()]
-    if paper.citation_count is not None:
-        meta_parts.append(f"인용 {paper.citation_count}")
-    meta_parts.append(f"`#{paper.topic_name}`")
-    meta = " · ".join(meta_parts)
-    if abstract_only:
-        meta += " · _(abstract 기반 요약)_"
-    return meta
-
-
-def extract_one_liner(summary: str, max_chars: int = 300) -> str:
-    """요약 마크다운에서 '한 줄 요약' 섹션 본문을 추출 (실패 시 앞부분으로 폴백)."""
-    m = _ONE_LINER_RE.search(summary)
-    text = m.group(1) if m else summary
-    text = " ".join(text.split())  # 개행/중복 공백 정리
-    # 폴백 시 남아 있을 수 있는 헤딩/볼드 장식 제거
-    text = _MD_HEADING_RE.sub(r"\1", _MD_BOLD_RE.sub(r"\1", text)).strip()
-    if len(text) > max_chars:
-        text = text[: max_chars - 1].rstrip() + "…"
-    return text
 
 
 def md_to_mrkdwn(text: str) -> str:
@@ -109,47 +59,6 @@ def _topic_channel_map(cfg: Config) -> dict[str, str]:
     return {t.name: t.channel for t in cfg.topics if t.channel}
 
 
-# ---------------------------------------------------------------- Publisher
-
-class Publisher(abc.ABC):
-    """발행 인터페이스. 새 백엔드는 이 클래스를 구현한다."""
-
-    @abc.abstractmethod
-    def publish(self, paper: Paper, summary: str, abstract_only: bool = False,
-                figures: list[bytes] | None = None) -> None:
-        ...
-
-    def close(self) -> None:  # 필요 시 오버라이드
-        pass
-
-
-class DryRunPublisher(Publisher):
-    """전송 없이 stdout으로 출력 (개발/테스트용). Slack 레이아웃대로 미리보기."""
-
-    def __init__(self, default_channel: str = "?", topic_channels: dict[str, str] | None = None):
-        self.default_channel = default_channel
-        self.topic_channels = topic_channels or {}
-
-    def _dest(self, paper: Paper) -> str:
-        return self.topic_channels.get(paper.topic_name, self.default_channel)
-
-    def publish(self, paper: Paper, summary: str, abstract_only: bool = False,
-                figures: list[bytes] | None = None) -> None:
-        fig_note = ""
-        if figures:
-            sizes = ", ".join(f"{len(f)//1024}KB" for f in figures)
-            fig_note = f" (+figure {len(figures)}개 첨부 예정: {sizes})"
-        print("=" * 70)
-        print(f"[DRY-RUN/slack → {self._dest(paper)}] 채널 메인 메시지")
-        print("-" * 70)
-        print(format_slack_main(paper, summary, abstract_only))
-        print("-" * 70)
-        print(f"[DRY-RUN/slack → {self._dest(paper)}] 스레드 댓글{fig_note}")
-        print("-" * 70)
-        print(format_slack_thread(summary))
-        print("=" * 70)
-
-
 class SlackPublisher(Publisher):
     """Slack 채널에 메인 메시지 + 스레드 댓글로 포스팅.
 
@@ -177,7 +86,6 @@ class SlackPublisher(Publisher):
         })
         self.channel = cfg.slack.channel                # 기본 채널
         self.topic_channels = _topic_channel_map(cfg)   # topic별 전용 채널
-        self.attach_figure = cfg.slack.attach_figure    # 대표 figure 스레드 첨부 여부
 
     def _channel_for(self, paper: Paper) -> str:
         return self.topic_channels.get(paper.topic_name, self.channel)
@@ -212,7 +120,7 @@ class SlackPublisher(Publisher):
         raise RuntimeError(f"Slack 전송 최종 실패: {last_err}") from last_err
 
     def publish(self, paper: Paper, summary: str, abstract_only: bool = False,
-                figures: list[bytes] | None = None) -> None:
+                figures: list[Figure] | None = None) -> None:
         channel = self._channel_for(paper)
         # 1) 채널 메인 메시지 (제목·메타·링크·한 줄 요약)
         main = self._post({
@@ -230,15 +138,16 @@ class SlackPublisher(Publisher):
             "unfurl_links": False,
             "unfurl_media": False,
         })
-        # 3) (옵션) 대표 figure들을 같은 스레드에 첨부 — 실패해도 발행은 성공으로 취급.
-        if figures and self.attach_figure:
+        # 3) 대표 figure·표를 같은 스레드에 첨부 — 실패해도 발행은 성공으로 취급.
+        #    (첨부 여부·장수는 extractor가 cfg.figures_for로 이미 적용 — 꺼져 있으면 figures가 비어 온다)
+        if figures:
             self._upload_figures(channel_id, main["ts"], figures, paper)
         logger.info("Slack 전송 완료: channel=%s ts=%s", channel, main["ts"])
 
     _scope_warned = False  # files:write 스코프 누락 경고는 1회만
 
     def _upload_figures(self, channel_id: str, thread_ts: str,
-                        figures: list[bytes], paper: Paper) -> None:
+                        figures: list[Figure], paper: Paper) -> None:
         """figure들을 스레드 댓글 하나에 묶어 업로드 (files:write 스코프 필요, 비치명적).
 
         Slack 2단계 external upload: 파일별 getUploadURLExternal → 바이트 업로드,
@@ -246,14 +155,13 @@ class SlackPublisher(Publisher):
         """
         import requests
 
-        safe_uid = paper.uid.replace(":", "_").replace("/", "_")
         uploaded: list[dict] = []
         try:
             for i, fig in enumerate(figures, start=1):
                 # 1단계: 업로드 URL 발급 (form-encoded 엔드포인트)
                 r = self.session.post(
                     "https://slack.com/api/files.getUploadURLExternal",
-                    data={"filename": f"{safe_uid}_fig{i}.png", "length": str(len(fig))},
+                    data={"filename": figure_filename(paper, fig), "length": str(len(fig.png))},
                     headers={"Content-Type": "application/x-www-form-urlencoded"},
                     timeout=30,
                 ).json()
@@ -269,9 +177,9 @@ class SlackPublisher(Publisher):
                     logger.warning("figure %d 업로드 URL 발급 실패(건너뜀): %s", i, r.get("error"))
                     continue
                 # 2단계: 바이트 업로드 (pre-signed URL, 인증 헤더 불필요)
-                up = requests.post(r["upload_url"], data=fig, timeout=60)
+                up = requests.post(r["upload_url"], data=fig.png, timeout=60)
                 up.raise_for_status()
-                uploaded.append({"id": r["file_id"], "title": f"Figure {i}"})
+                uploaded.append({"id": r["file_id"], "title": fig.label})
 
             if not uploaded:
                 return
@@ -282,16 +190,8 @@ class SlackPublisher(Publisher):
                 "files": uploaded,
             }, url="https://slack.com/api/files.completeUploadExternal")
             logger.info("figure %d개 첨부 완료 (%s)", len(uploaded),
-                        ", ".join(f"{len(f)//1024}KB" for f in figures[:len(uploaded)]))
+                        ", ".join(f"{f.label} {len(f.png)//1024}KB" for f in figures[:len(uploaded)]))
         except PublishConfigError:
             raise  # 토큰/권한 문제는 상위 정책대로 중단
         except Exception as e:  # noqa: BLE001 — figure는 비치명적
             logger.warning("figure 업로드 실패(텍스트만 발행): %s", e)
-
-
-def make_publisher(cfg: Config, force_dry_run: bool = False) -> Publisher:
-    """config의 slack.dry_run(또는 --dry-run)에 따라 DryRun / Slack publisher를 생성."""
-    if cfg.slack.dry_run or force_dry_run:
-        logger.info("dry-run 모드: Slack 전송 대신 stdout 출력")
-        return DryRunPublisher(default_channel=cfg.slack.channel, topic_channels=_topic_channel_map(cfg))
-    return SlackPublisher(cfg)
