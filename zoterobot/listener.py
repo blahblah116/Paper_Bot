@@ -29,7 +29,7 @@ from .slackbot import SlackBot
 from .sync import sync_library
 from .textcache import TextCache
 from .zotero import ZoteroClient
-from .zulipbot import GPU_WEBHOOK_ENV, ZulipBot, gpu_webhook_payload, post_gpu_webhook
+from .zulipbot import GPU_PENDING_EMOJI, GPU_WEBHOOK_ENV, ZulipBot, gpu_webhook_payload, post_gpu_webhook
 
 logger = logging.getLogger("zoterobot")
 
@@ -187,7 +187,9 @@ class Listener:
 
     def _forward_gpu(self, ev: dict, msg: dict) -> None:
         """'gpu …' DM → gpu_bot webhook. 챗봇(ensure_gpu·모델 로드)은 타지 않는다. 성공하면 답장은 gpu_bot이 보내므로
-        여기서는 보내지 않고, 미설정·전달 실패만 짧게 알린다. 허용 사용자 확인은 다른 DM과 같다."""
+        여기서는 보내지 않고, 미설정·전달 실패만 짧게 알린다. 허용 사용자 확인은 다른 DM과 같다.
+        POST 전에 원래 DM에 ⏳를 단다(gpu_bot이 먼저 끝나 ✅를 단 뒤에 ⏳가 붙지 않게). 성공하면 ⏳는 gpu_bot이 지우고,
+        실패하면 여기서 지운다. URL이 없으면 전달하지 않으므로 ⏳도 달지 않는다."""
         try:
             if not self.bot.allowed(ev, thread=False):
                 return
@@ -196,8 +198,11 @@ class Listener:
                 logger.warning("gpu DM을 받았지만 %s가 없어 전달하지 못함 (~/.paperbot_env)", GPU_WEBHOOK_ENV)
                 self.bot.reply(ev, "gpu 질문 전달이 아직 설정되지 않았어요.", thread=False)
                 return
-            err = post_gpu_webhook(url, gpu_webhook_payload(msg, self.zulip.bot_email, self.zulip.bot_full_name))
+            payload = gpu_webhook_payload(msg, self.zulip.bot_email, self.zulip.bot_full_name)
+            self.zulip.set_reaction(msg["id"], GPU_PENDING_EMOJI)
+            err = post_gpu_webhook(url, payload)
             if err:
+                self.zulip.set_reaction(msg["id"], GPU_PENDING_EMOJI, remove=True)
                 self.bot.reply(ev, f"⚠️ gpu 질문을 전달하지 못했어요 ({err}). 잠시 후 다시 보내 주세요.", thread=False)
         except Exception:  # noqa: BLE001 — 거절·안내 답장 실패 등 (URL은 post_gpu_webhook 밖으로 나오지 않는다)
             logger.exception("gpu DM 전달 중 예외")

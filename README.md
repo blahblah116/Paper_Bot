@@ -338,6 +338,7 @@ Collection names match case-insensitively; sub-collections are addressed by thei
 ```
 
 A DM whose first word is `gpu` or `/gpu` (any case), e.g. `gpu 지금 비어 있는 GPU 있어?`, skips the chat agent: zoterobot POSTs it unchanged to `GPU_BOT_WEBHOOK_URL` (Zulip outgoing-webhook JSON) and gpu_bot answers in the same DM. zoterobot itself only replies when the variable is unset or the POST fails (non-2xx or 10 s timeout). The allow-list applies as for any DM.
+Just before the POST zoterobot reacts ⏳ (`time_ticking`) to the DM; it removes the ⏳ again if the POST fails, and otherwise leaves it for gpu_bot, which swaps it for ✅ (`check`) when it has answered. A reaction that fails is only logged as a warning and never blocks the forward.
 
 Any other DM is a question for the chat agent, exactly as on Slack. The bot ignores its own messages (including the daily paperbot posts) and only reads DMs, so it does not need to be mentioned.
 
