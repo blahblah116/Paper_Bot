@@ -18,6 +18,7 @@ from .textcache import TextCache
 TITLE_RE = re.compile(r"^\*{1,2}(.+?)\*{1,2}\s*$", re.MULTILINE)   # paperbot 원글 첫 줄 '*제목*'(Slack) / '**제목**'(Zulip)
 HELP_WORDS = {"", "help", "도움말", "사용법", "list", "목록"}
 SAVE_WORDS = {"저장", "save", "/save"}       # Zulip DM에서 저장 명령을 여는 첫 단어 (나머지는 질문)
+GPU_WORDS = {"gpu", "/gpu"}                  # Zulip DM을 gpu_bot으로 넘기는 첫 단어 (대소문자 무시)
 _ID_PREFIX_WORDS = {"arxiv:", "doi:"}
 
 # Zulip DM 본문 정리용 — quote-and-reply 블록, 멘션(@**name** / @_**name|id**), "[said](link):", 마크다운 링크, 메시지 링크
@@ -99,8 +100,8 @@ def ref_token(r: PaperRef) -> str:
 
 @dataclass(frozen=True)
 class ZulipCommand:
-    kind: str                       # "save" | "chat"
-    text: str                       # save: 키워드를 뺀 명령 본문(+인용 속 식별자) / chat: 멘션을 뺀 질문
+    kind: str                       # "save" | "chat" | "gpu"
+    text: str                       # save: 키워드를 뺀 명령 본문(+인용 속 식별자) / chat: 멘션을 뺀 질문 / gpu: 원문 그대로
     message_ids: tuple[int, ...]    # 본문의 Zulip 메시지 링크(/near/<id>) — 식별자가 없을 때 그 메시지에서 찾는다
 
 
@@ -109,7 +110,8 @@ def parse_zulip_dm(content: str) -> ZulipCommand:
 
     첫 단어가 SAVE_WORDS면 저장: `저장 ICML/2026 <arXiv 링크>`. 논문 topic에서 'Quote and reply'로 가져온
     인용 블록(```quote … ```)이나 메시지 링크(…/near/123)를 붙여도 된다 — 인용 속 식별자는 명령에 덧붙이고,
-    식별자가 전혀 없으면 message_ids로 원글을 조회한다. 그 밖의 DM은 전부 질문(chat).
+    식별자가 전혀 없으면 message_ids로 원글을 조회한다. 첫 단어가 GPU_WORDS면 gpu_bot으로 넘길 DM(gpu, 원문 그대로).
+    그 밖의 DM은 전부 질문(chat).
     """
     quotes = _ZULIP_QUOTE_RE.findall(content)
     body = _ZULIP_QUOTE_RE.sub(" ", content)
@@ -122,6 +124,8 @@ def parse_zulip_dm(content: str) -> ZulipCommand:
         rest = _ZULIP_MDLINK_RE.sub(r"\2", " ".join(words[1:]))
         extra = [ref_token(r) for _, _, r in find_refs("\n".join(quotes))]
         return ZulipCommand("save", " ".join([rest, *extra]).strip(), message_ids)
+    if words and words[0].lower() in GPU_WORDS:
+        return ZulipCommand("gpu", content, ())
     return ZulipCommand("chat", body.strip(), ())
 
 

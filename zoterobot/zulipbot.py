@@ -8,11 +8,15 @@ zoterobot의 Zulip 쪽 — paperbot이 글을 올리는 바로 그 봇 계정으
 - 인증: ~/.paperbot_env의 ZULIP_EMAIL/ZULIP_API_KEY/ZULIP_SITE, 없으면 zuliprc(zulip.config_file) — paperbot과 공유.
   자기 자신이 보낸 메시지(paperbot 발행분 포함)는 버린다.
 - 메시지 수정(update)은 realm의 편집 제한 시간을 넘기면 실패한다 → 핸들러의 예비 경로(새 메시지)가 그대로 동작.
+- 'gpu …' DM은 챗봇을 타지 않고 gpu_bot의 webhook(GPU_BOT_WEBHOOK_URL)으로 넘긴다 — Zulip Outgoing webhook 모양의 JSON.
 """
 from __future__ import annotations
 
+import json
 import logging
 import threading
+import urllib.error
+import urllib.request
 from typing import Callable
 
 from paperbot.publisher import make_zulip_client, split_zulip_message, zulip_auth_error, zulip_math_spacing
@@ -24,17 +28,19 @@ logger = logging.getLogger(__name__)
 _CHANNEL_PREFIX = "zulip:dm:"
 # Slack 이모지 이름 → Zulip 이모지 이름 (핸들러는 Slack 이름으로 부른다)
 _EMOJI = {"eyes": "eyes", "white_check_mark": "check", "x": "cross_mark"}
+GPU_WEBHOOK_ENV = "GPU_BOT_WEBHOOK_URL"   # ~/.paperbot_env — 'gpu …' DM을 넘길 gpu_bot webhook. URL에 key가 들어 있다
 
 
 class ZulipBot:
     fmt = ZULIP
 
     def __init__(self, client, allowed_users: list[str], bot_user_id: int | None = None,
-                 bot_email: str = "", update_every: float = 5.0):
+                 bot_email: str = "", update_every: float = 5.0, bot_full_name: str = ""):
         self.client = client                 # zulip.Client (테스트에서는 가짜)
         self.allowed_users = [u.strip().lower() for u in allowed_users if u.strip()]
         self.bot_user_id = bot_user_id
         self.bot_email = bot_email
+        self.bot_full_name = bot_full_name
         self.update_every = update_every     # 스트리밍 갱신 최소 간격(초) — 편집마다 이력이 남아 Slack보다 띄엄띄엄
         self._thread: threading.Thread | None = None
 
@@ -144,6 +150,49 @@ class ZulipBot:
         return False
 
 
+# ---------------------------------------------------------------- 'gpu …' DM → gpu_bot webhook
+
+def gpu_webhook_payload(msg: dict, bot_email: str, bot_full_name: str = "") -> dict:
+    """Zulip message 이벤트 → Zulip Outgoing webhook 모양의 JSON. gpu_bot 쪽 필터는 bot_email과
+    message.sender_email을 본다. token·API key 같은 인증 정보는 넣지 않는다."""
+    content = msg.get("content", "") or ""
+    return {
+        "bot_email": bot_email,
+        "bot_full_name": bot_full_name,
+        "trigger": "direct_message",
+        "data": content,
+        "message": {
+            "id": int(msg.get("id") or 0),
+            "type": "private",
+            "sender_id": int(msg.get("sender_id") or 0),
+            "sender_email": str(msg.get("sender_email", "")),
+            "sender_full_name": str(msg.get("sender_full_name", "")),
+            "display_recipient": msg.get("display_recipient") or [],
+            "content": content,
+            "timestamp": int(msg.get("timestamp") or 0),
+        },
+    }
+
+
+def post_gpu_webhook(url: str, payload: dict, timeout: float = 10.0) -> str | None:
+    """payload를 gpu_bot webhook에 JSON POST. 2xx면 None, 아니면 사용자에게 보일 짧은 사유.
+    URL에는 key가 들어 있다 — log·반환값에 URL이나 예외 문자열을 남기지 않고 상태 코드(실패면 예외 종류)만 쓴다."""
+    try:
+        req = urllib.request.Request(url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status = resp.status
+    except urllib.error.HTTPError as e:
+        status = e.code
+        e.close()
+    except Exception as e:  # noqa: BLE001 — 잘못된 URL의 ValueError처럼 예외 문자열에 URL이 섞일 수 있어 종류만 남긴다
+        timed_out = isinstance(e, TimeoutError) or isinstance(getattr(e, "reason", None), TimeoutError)
+        logger.warning("gpu_bot webhook 전달 실패: %s%s", type(e).__name__, " (timeout)" if timed_out else "")
+        return "시간 초과" if timed_out else "연결 실패"
+    logger.info("gpu_bot webhook 응답 HTTP %d", status)
+    return None if 200 <= status < 300 else f"HTTP {status}"
+
+
 def connect(config_file: str, allowed_users: list[str], update_every: float = 5.0) -> ZulipBot:
     """환경변수(ZULIP_EMAIL/ZULIP_API_KEY/ZULIP_SITE) 또는 zuliprc로 접속해 봇 프로필을 확인한 ZulipBot.
     인증 정보·접속 문제는 RuntimeError."""
@@ -152,6 +201,7 @@ def connect(config_file: str, allowed_users: list[str], update_every: float = 5.
     if profile.get("result") != "success":
         raise RuntimeError(zulip_auth_error(profile))
     bot = ZulipBot(client, allowed_users, bot_user_id=int(profile["user_id"]),
-                   bot_email=str(profile.get("email", "")), update_every=update_every)
+                   bot_email=str(profile.get("email", "")), update_every=update_every,
+                   bot_full_name=str(profile.get("full_name", "")))
     logger.info("Zulip 봇 %s (id %s) 인증 OK — 허용 사용자 %d명", bot.bot_email, bot.bot_user_id, len(bot.allowed_users))
     return bot

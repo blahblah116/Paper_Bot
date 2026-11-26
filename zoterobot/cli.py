@@ -182,7 +182,7 @@ def serve(cfg: Config, zot: ZoteroClient, drive: DriveUploader, cache: TextCache
         logger.info("Slack Socket Mode 연결 — 멘션·DM 대기 중 (DM 챗봇 %s)", "켜짐" if agent else "꺼짐")
     if zbot is not None:
         zbot.start(listener.on_zulip_message)
-        logger.info("Zulip 이벤트 큐 연결 — DM 대기 중 ('저장 …'은 저장, 나머지는 챗봇 %s)", "켜짐" if agent else "꺼짐")
+        logger.info("Zulip 이벤트 큐 연결 — DM 대기 중 ('저장 …'은 저장, 'gpu …'는 gpu_bot 전달, 나머지는 챗봇 %s)", "켜짐" if agent else "꺼짐")
 
     stop = threading.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
