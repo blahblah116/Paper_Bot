@@ -9,6 +9,7 @@ zoterobot의 Zulip 쪽 — paperbot이 글을 올리는 바로 그 봇 계정으
   자기 자신이 보낸 메시지(paperbot 발행분 포함)는 버린다.
 - 메시지 수정(update)은 realm의 편집 제한 시간을 넘기면 실패한다 → 핸들러의 예비 경로(새 메시지)가 그대로 동작.
 - 'gpu …' DM은 챗봇을 타지 않고 gpu_bot의 webhook(GPU_BOT_WEBHOOK_URL)으로 넘긴다 — Zulip Outgoing webhook 모양의 JSON.
+  넘기기 전에 원래 DM에 ⏳(GPU_PENDING_EMOJI)를 달고, 전달에 실패하면 지운다.
 """
 from __future__ import annotations
 
@@ -29,6 +30,9 @@ _CHANNEL_PREFIX = "zulip:dm:"
 # Slack 이모지 이름 → Zulip 이모지 이름 (핸들러는 Slack 이름으로 부른다)
 _EMOJI = {"eyes": "eyes", "white_check_mark": "check", "x": "cross_mark"}
 GPU_WEBHOOK_ENV = "GPU_BOT_WEBHOOK_URL"   # ~/.paperbot_env — 'gpu …' DM을 넘길 gpu_bot webhook. URL에 key가 들어 있다
+# 'gpu …' DM 전달 중 원래 DM에 다는 ⏳ (Zulip 기본 emoji 이름 — emoji_codes.json에서 23f3의 canonical_name).
+# gpu_bot이 답을 마치면 같은 이름으로 지우고 ✅(check)를 단다. 반응은 단 계정만 지울 수 있다.
+GPU_PENDING_EMOJI = "time_ticking"
 
 
 class ZulipBot:
@@ -122,6 +126,18 @@ class ZulipBot:
                 logger.debug("reaction %s 실패: %s", name, res.get("msg"))
         except Exception as e:  # noqa: BLE001 — 비치명적
             logger.debug("reaction %s 실패: %s", name, e)
+
+    def set_reaction(self, message_id: int, emoji_name: str, remove: bool = False) -> None:
+        """메시지에 Zulip emoji 반응을 달거나(remove=True면 지우거나) 한다. emoji_name은 Zulip 이름 그대로.
+        실패해도 예외를 내지 않고 warning log만 남긴다 — 반응 때문에 전달·다른 DM 처리가 멈추면 안 된다."""
+        what = "제거" if remove else "추가"
+        try:
+            fn = self.client.remove_reaction if remove else self.client.add_reaction
+            res = fn({"message_id": int(message_id), "emoji_name": emoji_name})
+            if res.get("result") != "success":
+                logger.warning("Zulip 반응 %s %s 실패 (메시지 %s): %s", emoji_name, what, message_id, res.get("msg", res))
+        except Exception as e:  # noqa: BLE001 — 예외 문자열에 접속 정보가 섞일 수 있어 종류만 남긴다
+            logger.warning("Zulip 반응 %s %s 실패 (메시지 %s): %s", emoji_name, what, message_id, type(e).__name__)
 
     def fetch_message(self, message_id: int) -> str:
         """메시지 id → 원문(마크다운). 봇이 볼 수 있는 메시지(공개 스트림·구독 스트림·자기 DM)만."""
