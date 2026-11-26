@@ -15,6 +15,7 @@ zulip:                        # Zulip entry point: DMs to the same bot account p
   config_file: "../zuliprc"   # fallback zuliprc (repo root); ZULIP_EMAIL / ZULIP_API_KEY / ZULIP_SITE in ~/.paperbot_env take precedence
                               # 예비용 zuliprc — ~/.paperbot_env의 ZULIP_EMAIL·ZULIP_API_KEY·ZULIP_SITE가 있으면 그쪽 우선
   allowed_users: []           # Zulip e-mails or numeric user ids; empty = reject everyone / Zulip 이메일 또는 사용자 id (비면 전부 거절)
+  gpu_allowed_users: ["*"]    # users for 'gpu …' DMs only; "*" = everyone, no key = allowed_users / 'gpu …' DM만 허용할 사용자. "*"=모두, 없으면 allowed_users
   update_every_s: 5           # min seconds between streaming edits (each edit leaves history in Zulip) / 스트리밍 갱신 최소 간격
 
 library:                      # thread command '@zoterobot <collection>' → Zotero + Google Drive / 스레드 저장 명령

@@ -187,11 +187,12 @@ class Listener:
 
     def _forward_gpu(self, ev: dict, msg: dict) -> None:
         """'gpu …' DM → gpu_bot webhook. 챗봇(ensure_gpu·모델 로드)은 타지 않는다. 성공하면 답장은 gpu_bot이 보내므로
-        여기서는 보내지 않고, 미설정·전달 실패만 짧게 알린다. 허용 사용자 확인은 다른 DM과 같다.
+        여기서는 보내지 않고, 미설정·전달 실패만 짧게 알린다. 허용 사용자는 zulip.gpu_allowed_users로 따로 본다
+        (키가 없으면 allowed_users — 다른 DM과 같다).
         POST 전에 원래 DM에 ⏳를 단다(gpu_bot이 먼저 끝나 ✅를 단 뒤에 ⏳가 붙지 않게). 성공하면 ⏳는 gpu_bot이 지우고,
         실패하면 여기서 지운다. URL이 없으면 전달하지 않으므로 ⏳도 달지 않는다."""
         try:
-            if not self.bot.allowed(ev, thread=False):
+            if not self.zulip.gpu_allowed(ev):
                 return
             url = os.environ.get(GPU_WEBHOOK_ENV, "").strip()
             if not url:

@@ -116,7 +116,8 @@ def check(cfg: Config, zot: ZoteroClient, drive: DriveUploader) -> int:
         rc = 1
     if cfg.zulip.enabled:
         try:
-            zb = zulipbot.connect(cfg.resolve(cfg.zulip.config_file), cfg.zulip.allowed_users)
+            zb = zulipbot.connect(cfg.resolve(cfg.zulip.config_file), cfg.zulip.allowed_users,
+                                  gpu_allowed_users=cfg.zulip.gpu_allowed_users)
             logger.info("Zulip OK — 봇 %s, 허용 사용자 %s", zb.bot_email, cfg.zulip.allowed_users or "(없음 — 전부 거절)")
         except RuntimeError as e:
             logger.error("Zulip 점검 실패: %s", e)
@@ -133,7 +134,7 @@ def serve(cfg: Config, zot: ZoteroClient, drive: DriveUploader, cache: TextCache
     if cfg.zulip.enabled:
         try:
             zbot = zulipbot.connect(cfg.resolve(cfg.zulip.config_file), cfg.zulip.allowed_users,
-                                    cfg.zulip.update_every_s)
+                                    cfg.zulip.update_every_s, gpu_allowed_users=cfg.zulip.gpu_allowed_users)
         except RuntimeError as e:
             logger.error("Zulip 접속 실패: %s", e)
             return 2

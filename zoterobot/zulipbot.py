@@ -10,6 +10,7 @@ zoterobot의 Zulip 쪽 — paperbot이 글을 올리는 바로 그 봇 계정으
 - 메시지 수정(update)은 realm의 편집 제한 시간을 넘기면 실패한다 → 핸들러의 예비 경로(새 메시지)가 그대로 동작.
 - 'gpu …' DM은 챗봇을 타지 않고 gpu_bot의 webhook(GPU_BOT_WEBHOOK_URL)으로 넘긴다 — Zulip Outgoing webhook 모양의 JSON.
   넘기기 전에 원래 DM에 ⏳(GPU_PENDING_EMOJI)를 달고, 전달에 실패하면 지운다.
+  허용 목록은 zulip.gpu_allowed_users("*"=모두, 키가 없으면 allowed_users)로 따로 본다(gpu_allowed).
 """
 from __future__ import annotations
 
@@ -39,9 +40,13 @@ class ZulipBot:
     fmt = ZULIP
 
     def __init__(self, client, allowed_users: list[str], bot_user_id: int | None = None,
-                 bot_email: str = "", update_every: float = 5.0, bot_full_name: str = ""):
+                 bot_email: str = "", update_every: float = 5.0, bot_full_name: str = "",
+                 gpu_allowed_users: list[str] | None = None):
         self.client = client                 # zulip.Client (테스트에서는 가짜)
         self.allowed_users = [u.strip().lower() for u in allowed_users if u.strip()]
+        # 'gpu …' DM 전용 허용 목록 — None(설정 키 없음)이면 allowed_users를 그대로 쓴다. "*"가 있으면 모두 허용
+        self.gpu_allowed_users = (None if gpu_allowed_users is None
+                                  else [u.strip().lower() for u in gpu_allowed_users if u.strip()])
         self.bot_user_id = bot_user_id
         self.bot_email = bot_email
         self.bot_full_name = bot_full_name
@@ -157,11 +162,22 @@ class ZulipBot:
         return self.fetch_message(int(mid)) if mid and str(mid).isdigit() else ""
 
     def allowed(self, ev: dict, thread: bool) -> bool:
-        user, uid = ev.get("user", ""), str(ev.get("user_id", ""))
-        if user in self.allowed_users or uid in self.allowed_users:
+        return self._check(ev, self.allowed_users, "zulip.allowed_users", thread)
+
+    def gpu_allowed(self, ev: dict) -> bool:
+        """'gpu …' DM 허용 여부 — zulip.gpu_allowed_users("*"면 모두), 키가 없으면 allowed_users(이때 "*"는 특별하지 않다)."""
+        if self.gpu_allowed_users is None:
+            return self._check(ev, self.allowed_users, "zulip.gpu_allowed_users", thread=False)
+        if "*" in self.gpu_allowed_users:
             return True
-        logger.warning("허용되지 않은 Zulip 사용자 %s(%s) 거절 (허용하려면 zoterobot/config.yaml zulip.allowed_users에 추가)",
-                       user, uid)
+        return self._check(ev, self.gpu_allowed_users, "zulip.gpu_allowed_users", thread=False)
+
+    def _check(self, ev: dict, users: list[str], key: str, thread: bool) -> bool:
+        user, uid = ev.get("user", ""), str(ev.get("user_id", ""))
+        if user in users or uid in users:
+            return True
+        logger.warning("허용되지 않은 Zulip 사용자 %s(%s) 거절 (허용하려면 zoterobot/config.yaml %s에 추가)",
+                       user, uid, key)
         self.reply(ev, f"이 봇은 허용된 사용자만 쓸 수 있습니다. (사용자: `{user}`, id `{uid}`)", thread=thread)
         return False
 
@@ -209,7 +225,8 @@ def post_gpu_webhook(url: str, payload: dict, timeout: float = 10.0) -> str | No
     return None if 200 <= status < 300 else f"HTTP {status}"
 
 
-def connect(config_file: str, allowed_users: list[str], update_every: float = 5.0) -> ZulipBot:
+def connect(config_file: str, allowed_users: list[str], update_every: float = 5.0,
+            gpu_allowed_users: list[str] | None = None) -> ZulipBot:
     """환경변수(ZULIP_EMAIL/ZULIP_API_KEY/ZULIP_SITE) 또는 zuliprc로 접속해 봇 프로필을 확인한 ZulipBot.
     인증 정보·접속 문제는 RuntimeError."""
     client = make_zulip_client(config_file)
@@ -218,6 +235,8 @@ def connect(config_file: str, allowed_users: list[str], update_every: float = 5.
         raise RuntimeError(zulip_auth_error(profile))
     bot = ZulipBot(client, allowed_users, bot_user_id=int(profile["user_id"]),
                    bot_email=str(profile.get("email", "")), update_every=update_every,
-                   bot_full_name=str(profile.get("full_name", "")))
-    logger.info("Zulip 봇 %s (id %s) 인증 OK — 허용 사용자 %d명", bot.bot_email, bot.bot_user_id, len(bot.allowed_users))
+                   bot_full_name=str(profile.get("full_name", "")), gpu_allowed_users=gpu_allowed_users)
+    gpu = bot.gpu_allowed_users
+    logger.info("Zulip 봇 %s (id %s) 인증 OK — 허용 사용자 %d명, gpu DM 허용 %s", bot.bot_email, bot.bot_user_id,
+                len(bot.allowed_users), "allowed_users와 같음" if gpu is None else ("모두" if "*" in gpu else f"{len(gpu)}명"))
     return bot

@@ -64,6 +64,7 @@ class ZulipConfig:
     enabled: bool = False
     config_file: str = "../zuliprc"           # paperbot config의 zulip.config_file과 같은 파일 (repo 루트 기준 ../)
     allowed_users: list[str] = field(default_factory=list)   # Zulip 사용자 이메일 또는 숫자 id. 비면 전부 거절(거절 답글에 표시)
+    gpu_allowed_users: list[str] | None = None   # 'gpu …' DM만 허용할 사용자. "*"가 있으면 모두. None(키 없음)이면 allowed_users
     update_every_s: float = 5.0               # 답변 스트리밍 갱신 최소 간격(초) — Zulip은 편집마다 이력이 남는다
 
 
@@ -158,11 +159,15 @@ def load_config(path: str) -> Config:
     z_allowed = z_d.get("allowed_users") or []
     if not isinstance(z_allowed, list):
         raise ConfigError("zulip.allowed_users는 Zulip 이메일/사용자 id 리스트여야 합니다.")
+    z_gpu = z_d.get("gpu_allowed_users")   # 키가 없거나 값이 비어 있으면(null) None → allowed_users를 쓴다
+    if z_gpu is not None and not isinstance(z_gpu, list):
+        raise ConfigError('zulip.gpu_allowed_users는 Zulip 이메일/사용자 id 리스트여야 합니다. (모두 허용은 ["*"])')
     zd = ZulipConfig()
     zulip = ZulipConfig(
         enabled=bool(z_d.get("enabled", zd.enabled)),
         config_file=str(z_d.get("config_file", zd.config_file)).strip(),
         allowed_users=[str(u).strip() for u in z_allowed if str(u).strip()],
+        gpu_allowed_users=None if z_gpu is None else [str(u).strip() for u in z_gpu if str(u).strip()],
         update_every_s=float(z_d.get("update_every_s", zd.update_every_s)),
     )
     if zulip.enabled and not zulip.config_file:
