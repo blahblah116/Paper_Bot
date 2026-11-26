@@ -74,6 +74,7 @@ Temporary: Zulip topics first replay older papers (3 per day) and hold new ones 
 | Input | What happens |
 |---|---|
 | Slack thread mention / Zulip DM `저장 <collection>` | Identify the paper → Zotero item + PDF on Google Drive (linked file) |
+| Zulip DM starting with `gpu` | Forwarded as-is to gpu_bot's webhook (`GPU_BOT_WEBHOOK_URL`); gpu_bot replies. No LLM, no GPU check |
 | Any other DM | The LLM calls tools (search / read / compare / summarize) over the chat cache and answers from the full text |
 
 ### 1.6 Shared code
@@ -194,6 +195,7 @@ For Zulip add the bot's credentials to the same file (paperbot, articlebot and z
 export ZULIP_EMAIL="paperbot-bot@your-zulip.example.com"   # bot e-mail from its settings page
 export ZULIP_API_KEY="..."                                   # bot API key
 export ZULIP_SITE="https://your-zulip.example.com"           # server URL
+export GPU_BOT_WEBHOOK_URL="https://..."                     # optional — gpu_bot webhook for `gpu …` DMs (contains a key; never logged)
 ```
 
 Alternatively drop the downloaded `zuliprc` at the repository root (gitignored, path in `zulip.config_file`); the environment variables win when both exist.
@@ -334,6 +336,8 @@ Collection names match case-insensitively; sub-collections are addressed by thei
 저장 GDL https://…/near/12345                    or paste the paper message's link ("Copy link to message")
 저장                                             usage + list of collections
 ```
+
+A DM whose first word is `gpu` or `/gpu` (any case), e.g. `gpu 지금 비어 있는 GPU 있어?`, skips the chat agent: zoterobot POSTs it unchanged to `GPU_BOT_WEBHOOK_URL` (Zulip outgoing-webhook JSON) and gpu_bot answers in the same DM. zoterobot itself only replies when the variable is unset or the POST fails (non-2xx or 10 s timeout). The allow-list applies as for any DM.
 
 Any other DM is a question for the chat agent, exactly as on Slack. The bot ignores its own messages (including the daily paperbot posts) and only reads DMs, so it does not need to be mentioned.
 

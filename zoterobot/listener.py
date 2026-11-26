@@ -3,7 +3,8 @@
 
 - Slack: 채널 멘션(app_mention) → 저장 큐, DM(message.im) → 챗 큐. 큐·워커 스레드가 분리돼 있어
   DM 답변(LLM, 느림)이 저장 명령을 막지 않는다. DM 안의 멘션은 message.im으로 이미 받으므로 무시.
-- Zulip: DM만 받는다. 첫 단어가 '저장/save'면 저장 큐(링크·인용·메시지 링크에서 논문 식별), 나머지는 챗 큐.
+- Zulip: DM만 받는다. 첫 단어가 '저장/save'면 저장 큐(링크·인용·메시지 링크에서 논문 식별), 'gpu'면 큐를 거치지 않고
+  gpu_bot webhook으로 넘기고(챗봇·GPU 확인 없음, 답장은 gpu_bot이), 나머지는 챗 큐.
   두 플랫폼이 같은 큐·핸들러를 쓰므로 LLM 작업은 여전히 한 번에 하나만 돈다.
 - 핸들러가 받는 bot은 MultiBot — ev["platform"]으로 SlackBot/ZulipBot을 고른다.
 - 봇 자신에게 온 이벤트만 처리한다(앱에 '사용자 이벤트'가 구독돼 있으면 남의 DM까지 들어오므로 버림).
@@ -13,6 +14,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import threading
 import time
@@ -27,7 +29,7 @@ from .slackbot import SlackBot
 from .sync import sync_library
 from .textcache import TextCache
 from .zotero import ZoteroClient
-from .zulipbot import ZulipBot
+from .zulipbot import GPU_WEBHOOK_ENV, ZulipBot, gpu_webhook_payload, post_gpu_webhook
 
 logger = logging.getLogger("zoterobot")
 
@@ -156,7 +158,8 @@ class Listener:
         (self.chats if is_dm else self.jobs).put(ev)
 
     def on_zulip_message(self, msg: dict) -> None:
-        """Zulip 이벤트 스레드 콜백 — DM만: '저장 …'은 저장 큐, 나머지는 챗 큐. 봇 자신의 메시지는 버린다."""
+        """Zulip 이벤트 스레드 콜백 — DM만: '저장 …'은 저장 큐, 'gpu …'는 gpu_bot 전달(별도 스레드), 나머지는 챗 큐.
+        봇 자신의 메시지는 버린다."""
         if self.zulip is None:
             return
         ev = self.zulip.to_event(msg)
@@ -171,12 +174,36 @@ class Listener:
                 pass
             return
         ev["text"] = cmd.text
-        if cmd.kind == "save":
+        if cmd.kind == "gpu":
+            with self._in_lock:
+                self._in_flight += 1     # 종료 대기(drain)가 전달까지 기다리게
+            threading.Thread(target=self._forward_gpu, args=(ev, msg), name="gpu-forward", daemon=True).start()
+        elif cmd.kind == "save":
             if cmd.message_ids and not find_refs(cmd.text):
                 ev["thread_ts"] = str(cmd.message_ids[0])   # 식별자가 없으면 링크된 메시지(논문 원글)에서 찾는다
             self.jobs.put(ev)
         else:
             self.chats.put(ev)
+
+    def _forward_gpu(self, ev: dict, msg: dict) -> None:
+        """'gpu …' DM → gpu_bot webhook. 챗봇(ensure_gpu·모델 로드)은 타지 않는다. 성공하면 답장은 gpu_bot이 보내므로
+        여기서는 보내지 않고, 미설정·전달 실패만 짧게 알린다. 허용 사용자 확인은 다른 DM과 같다."""
+        try:
+            if not self.bot.allowed(ev, thread=False):
+                return
+            url = os.environ.get(GPU_WEBHOOK_ENV, "").strip()
+            if not url:
+                logger.warning("gpu DM을 받았지만 %s가 없어 전달하지 못함 (~/.paperbot_env)", GPU_WEBHOOK_ENV)
+                self.bot.reply(ev, "gpu 질문 전달이 아직 설정되지 않았어요.", thread=False)
+                return
+            err = post_gpu_webhook(url, gpu_webhook_payload(msg, self.zulip.bot_email, self.zulip.bot_full_name))
+            if err:
+                self.bot.reply(ev, f"⚠️ gpu 질문을 전달하지 못했어요 ({err}). 잠시 후 다시 보내 주세요.", thread=False)
+        except Exception:  # noqa: BLE001 — 거절·안내 답장 실패 등 (URL은 post_gpu_webhook 밖으로 나오지 않는다)
+            logger.exception("gpu DM 전달 중 예외")
+        finally:
+            with self._in_lock:
+                self._in_flight -= 1
 
     def _for_bot(self, auths: list[dict]) -> bool:
         """봇 자신에게 온 이벤트만 처리. authorizations에 봇이 없는 이벤트는 내용을 보지 않고 버린다."""
