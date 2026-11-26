@@ -311,7 +311,7 @@ Drive access uses [rclone](https://rclone.org) (`~/.local/bin/rclone`): `rclone 
 | Section | Keys | Notes |
 |---|---|---|
 | top level | `allowed_users` | Slack user IDs that may use the bot. Empty = everyone is rejected; the reply shows the caller's ID |
-| `zulip` | `enabled`, `config_file`, `allowed_users`, `update_every_s` | Zulip DM entry point through the paperbot bot account (`../zuliprc` by default). `allowed_users` are Zulip e-mails or numeric ids. With `enabled: true` the listener runs with Slack, or without it when no Slack tokens are set |
+| `zulip` | `enabled`, `config_file`, `allowed_users`, `gpu_allowed_users`, `update_every_s` | Zulip DM entry point through the paperbot bot account (`../zuliprc` by default). `allowed_users` are Zulip e-mails or numeric ids. `gpu_allowed_users` applies to `gpu …` DMs only (`["*"]` = everyone; no key = `allowed_users`). With `enabled: true` the listener runs with Slack, or without it when no Slack tokens are set |
 | `library` | `drive_remote`, `link_base`, `rclone_bin`, `tag`, `filename_lang`, `unpaywall_email` | `filename_lang: ko` gives `A 등 - 2024 - …` names like a Korean Zotero UI |
 | `chat` | `llm_url`, `model`, `max_output_tokens`, `max_tool_steps`, `ctx_tokens`, `output_reserve_tokens`, `safety_tokens`, `history_max_tokens`, `chars_per_token`, `summary_enabled`, `paperbot_config`, `summaries_per_question`, `history_turns`, `vram_gpus`, `vram_min_mib`, `catalog_max`, `text_db`, `chatlog_dir`, `sync_interval_min`, `drive_scan`, `drain_timeout_s` | `llm_url` is llama-swap without `/v1`. Use the same model as paperbot so only one copy sits in VRAM; how long it stays loaded after a DM is llama-swap's `ttl`. Tool text is budgeted in tokens (see *Token budget* below): `ctx_tokens` must equal llama-server's `-c`. `summarize_paper` runs paperbot's summarizer (from `paperbot_config`) on the cached full text (PDF fetched from Drive only if the cache has none), at most `summaries_per_question` new summaries per question |
 
@@ -337,7 +337,8 @@ Collection names match case-insensitively; sub-collections are addressed by thei
 저장                                             usage + list of collections
 ```
 
-A DM whose first word is `gpu` or `/gpu` (any case), e.g. `gpu 지금 비어 있는 GPU 있어?`, skips the chat agent: zoterobot POSTs it unchanged to `GPU_BOT_WEBHOOK_URL` (Zulip outgoing-webhook JSON) and gpu_bot answers in the same DM. zoterobot itself only replies when the variable is unset or the POST fails (non-2xx or 10 s timeout). The allow-list applies as for any DM.
+A DM whose first word is `gpu` or `/gpu` (any case), e.g. `gpu 지금 비어 있는 GPU 있어?`, skips the chat agent: zoterobot POSTs it unchanged to `GPU_BOT_WEBHOOK_URL` (Zulip outgoing-webhook JSON) and gpu_bot answers in the same DM. zoterobot itself only replies when the variable is unset or the POST fails (non-2xx or 10 s timeout).
+Who may send `gpu …` DMs is set separately by `zulip.gpu_allowed_users` (Zulip e-mails or numeric ids; `["*"]` = everyone). Without the key it is `zulip.allowed_users`, as for any other DM; the chat agent and `저장` always use `zulip.allowed_users` only.
 Just before the POST zoterobot reacts ⏳ (`time_ticking`) to the DM; it removes the ⏳ again if the POST fails, and otherwise leaves it for gpu_bot, which swaps it for ✅ (`check`) when it has answered. A reaction that fails is only logged as a warning and never blocks the forward.
 
 Any other DM is a question for the chat agent, exactly as on Slack. The bot ignores its own messages (including the daily paperbot posts) and only reads DMs, so it does not need to be mentioned.
