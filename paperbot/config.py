@@ -34,6 +34,8 @@ class S2SourceConfig:
 class ArxivSourceConfig:
     enabled: bool = True
     query: str = ""
+    hf_orgs: list[str] = field(default_factory=list)  # Hugging Face 회사 계정 — 모델 태그의 arxiv:<id>도 받는다
+    hf_backfill_days: int = 1095                      # --backfill 때 HF 경로가 거슬러 올라갈 일수 (기본 3년)
 
 
 @dataclass(frozen=True)
@@ -219,9 +221,18 @@ def _parse_topic(i: int, raw: Any) -> Topic:
         ax_d = _as_dict(sources["arxiv"], f"{ctx}.sources.arxiv")
         enabled = bool(ax_d.get("enabled", True))
         query = str(ax_d.get("query", "")).strip()
-        if enabled and not query:
-            raise ConfigError(f"{ctx}.sources.arxiv: enabled인데 query가 없습니다.")
-        arxiv = ArxivSourceConfig(enabled=enabled, query=query)
+        hf_orgs = ax_d.get("hf_orgs", [])
+        if hf_orgs is None:
+            hf_orgs = []
+        if not isinstance(hf_orgs, list):
+            raise ConfigError(f"{ctx}.sources.arxiv.hf_orgs는 리스트여야 합니다.")
+        if enabled and not query and not hf_orgs:
+            raise ConfigError(f"{ctx}.sources.arxiv: enabled인데 query도 hf_orgs도 없습니다.")
+        hf_backfill_days = ax_d.get("hf_backfill_days", ArxivSourceConfig.hf_backfill_days)
+        if isinstance(hf_backfill_days, bool) or not isinstance(hf_backfill_days, int) or hf_backfill_days < 1:
+            raise ConfigError(f"{ctx}.sources.arxiv.hf_backfill_days는 1 이상의 정수(일)여야 합니다: {hf_backfill_days!r}")
+        arxiv = ArxivSourceConfig(enabled=enabled, query=query, hf_orgs=[str(o).strip() for o in hf_orgs],
+                                  hf_backfill_days=hf_backfill_days)
 
     if s2 is None and (arxiv is None or not arxiv.enabled):
         raise ConfigError(f"{ctx}: 활성화된 소스가 하나도 없습니다.")
