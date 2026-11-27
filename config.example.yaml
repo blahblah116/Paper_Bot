@@ -37,6 +37,8 @@ topics:
         # hf_backfill_days: 1095     # optional: how far back (days) the hf_orgs path goes on --backfill (default 1095 = 3 years)
                                      # 선택: --backfill 때 hf_orgs 경로가 거슬러 올라갈 일수 (기본 1095 = 3년)
     # quota: {s2: 2, arxiv: 3}      # per-topic override of the global quota / 이 topic만 쿼터 덮어쓰기
+                                    # pending_max_age_days: N in here overrides quota.pending_max_age_days for this topic (0 = never expire)
+                                    # 여기에 pending_max_age_days: N을 넣으면 이 topic만 pending 만료 기준을 덮어씀 (0 = 만료 없음)
 
   - name: "cad-reverse-engineering"
     channel: "#papers-cad"

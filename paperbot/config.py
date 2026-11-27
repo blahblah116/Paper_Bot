@@ -50,6 +50,7 @@ class Topic:
     zulip_topic: str | None = None         # platform이 zulip일 때 이 주제의 논문을 전부 넣을 고정 Zulip topic. None이면 논문마다 topic(=제목)
     quota_s2: int | None = None            # topic별 쿼터 오버라이드. None이면 quota.s2_per_topic 사용
     quota_arxiv: int | None = None         # None이면 quota.arxiv_per_topic 사용. 0 = 무제한
+    pending_max_age_days: int | None = None  # None이면 quota.pending_max_age_days 사용. 0 = 이 topic의 pending은 만료 없음
 
 
 # ---------------------------------------------------------------- 섹션들
@@ -250,13 +251,13 @@ def _parse_topic(i: int, raw: Any) -> Topic:
     if zulip_topic and len(zulip_topic) > ZULIP_TOPIC_MAX:
         raise ConfigError(f"{ctx}.zulip_topic은 {ZULIP_TOPIC_MAX}자 이하여야 합니다 (Zulip 제한): {zulip_topic}")
 
-    # topic별 쿼터 오버라이드 (선택): quota: {s2: N, arxiv: N}. 없는 키는 전역 quota를 따른다.
-    quota_s2 = quota_arxiv = None
+    # topic별 쿼터 오버라이드 (선택): quota: {s2: N, arxiv: N, pending_max_age_days: N}. 없는 키는 전역 quota를 따른다.
+    quota_s2 = quota_arxiv = pending_max_age_days = None
     if t.get("quota") is not None:
         q_d = _as_dict(t["quota"], f"{ctx}.quota")
-        unknown = set(q_d) - {"s2", "arxiv"}
+        unknown = set(q_d) - {"s2", "arxiv", "pending_max_age_days"}
         if unknown:
-            raise ConfigError(f"{ctx}.quota에 알 수 없는 키: {sorted(unknown)} (허용: s2, arxiv)")
+            raise ConfigError(f"{ctx}.quota에 알 수 없는 키: {sorted(unknown)} (허용: s2, arxiv, pending_max_age_days)")
         if "s2" in q_d and q_d["s2"] is not None:
             quota_s2 = int(q_d["s2"])
         if "arxiv" in q_d and q_d["arxiv"] is not None:
@@ -264,9 +265,14 @@ def _parse_topic(i: int, raw: Any) -> Topic:
         for k, v in (("s2", quota_s2), ("arxiv", quota_arxiv)):
             if v is not None and v < 0:
                 raise ConfigError(f"{ctx}.quota.{k}는 0(무제한) 이상이어야 합니다.")
+        age = q_d.get("pending_max_age_days")
+        if age is not None and (isinstance(age, bool) or not isinstance(age, int) or age < 0):
+            raise ConfigError(f"{ctx}.quota.pending_max_age_days는 0(만료 없음) 이상의 정수(일)여야 합니다: {age!r}")
+        pending_max_age_days = age
 
     return Topic(name=name, interest=interest, s2=s2, arxiv=arxiv, channel=channel, platform=platform,
-                 stream=stream, zulip_topic=zulip_topic, quota_s2=quota_s2, quota_arxiv=quota_arxiv)
+                 stream=stream, zulip_topic=zulip_topic, quota_s2=quota_s2, quota_arxiv=quota_arxiv,
+                 pending_max_age_days=pending_max_age_days)
 
 
 def load_config(path: str) -> Config:
