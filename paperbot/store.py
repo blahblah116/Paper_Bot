@@ -7,7 +7,7 @@ s2_cursor 테이블: S2 인용순 topic의 페이지 커서(bulk 검색 continua
 status 값:
   done              요약·포스팅 완료 → 재처리 안 함
   filtered_out      relevance 필터 탈락 → 재채점하지 않도록 기록
-  pending           필터는 통과했지만 발행 쿼터에 밀림 → 대기열(FIFO). payload에 Paper 전체 보존.
+  pending           필터는 통과했지만 발행 쿼터에 밀림 → 대기열(FIFO, topic의 pending_order가 published면 arXiv id 순). payload에 Paper 전체 보존.
   expired           pending이 pending_max_age_days를 넘겨 폐기됨
   failed            1회 실패 → 다음 실행 때 재시도 대상
   failed_permanent  재시도도 실패 → 영구 skip
@@ -21,6 +21,7 @@ import dataclasses
 import json
 import logging
 import os
+import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
@@ -52,6 +53,18 @@ CREATE TABLE IF NOT EXISTS s2_cursor (
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+_ARXIV_ID_RE = re.compile(r"^(\d{4})\.(\d{4,5})$")   # YYMM.NNNNN — 옛 형식(cs/0101001)은 arXiv id 없음으로 친다
+
+
+def _published_key(paper: Paper) -> tuple[int, int, int]:
+    """pending_order "published"의 정렬 키 — arXiv id의 (YYMM, 번호) 순이 공개 순 (번호는 정수로 비교해 4·5자리가 섞여도 맞다).
+    arXiv id가 없는 논문은 그 뒤에 연도 순(연도 없으면 맨 뒤). 정렬이 안정적이라 같은 키는 들어온 순 그대로."""
+    m = _ARXIV_ID_RE.match(paper.arxiv_id or "")
+    if m:
+        return (0, int(m.group(1)), int(m.group(2)))
+    return (1, paper.year if paper.year is not None else 9999, 0)
 
 
 class Store:
@@ -147,8 +160,9 @@ class Store:
         self._upsert(paper, "pending", None, payload=payload)
         return True
 
-    def load_pending(self, topic: str, source: str) -> list[Paper]:
-        """topic × source의 대기열을 오래된 순(FIFO)으로 반환."""
+    def load_pending(self, topic: str, source: str, order: str = "queued") -> list[Paper]:
+        """topic × source의 대기열을 오래된 순으로 반환. order "queued"(기본)는 들어온 순(FIFO),
+        "published"는 논문이 공개된 순(arXiv id 순, arXiv id 없는 논문은 그 뒤에 연도 → 들어온 순)."""
         rows = self.conn.execute(
             "SELECT uid, payload FROM papers WHERE status='pending' AND topic=? AND source=? "
             "ORDER BY processed_at ASC",
@@ -163,14 +177,18 @@ class Store:
                 out.append(Paper(**json.loads(r["payload"])))
             except (TypeError, ValueError) as e:
                 logger.warning("pending payload 복원 실패 — 건너뜀: %s (%s)", r["uid"], e)
+        if order == "published":
+            out.sort(key=_published_key)
         return out
 
-    def load_all_pending(self, topics: list[str]) -> list[Paper]:
-        """모든 (topic, source) 대기열을 합쳐 FIFO로 반환 — apply_quota 입력용."""
+    def load_all_pending(self, topics: list[str], orders: dict[str, str] | None = None) -> list[Paper]:
+        """모든 (topic, source) 대기열을 합쳐 반환 — apply_quota 입력용.
+        orders({topic: pending_order})에 없는 topic은 FIFO."""
+        orders = orders or {}
         out: list[Paper] = []
         for t in topics:
             for src in ("semantic_scholar", "arxiv"):
-                out.extend(self.load_pending(t, src))
+                out.extend(self.load_pending(t, src, orders.get(t, "queued")))
         return out
 
     def count_pending(self) -> dict[tuple[str, str], int]:

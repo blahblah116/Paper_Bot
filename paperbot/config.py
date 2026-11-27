@@ -51,6 +51,7 @@ class Topic:
     quota_s2: int | None = None            # topic별 쿼터 오버라이드. None이면 quota.s2_per_topic 사용
     quota_arxiv: int | None = None         # None이면 quota.arxiv_per_topic 사용. 0 = 무제한
     pending_max_age_days: int | None = None  # None이면 quota.pending_max_age_days 사용. 0 = 이 topic의 pending은 만료 없음
+    pending_order: str = "queued"          # 대기열을 꺼내는 순서: "queued"(들어온 순) | "published"(arXiv id 순 = 논문이 공개된 순)
 
 
 # ---------------------------------------------------------------- 섹션들
@@ -251,13 +252,14 @@ def _parse_topic(i: int, raw: Any) -> Topic:
     if zulip_topic and len(zulip_topic) > ZULIP_TOPIC_MAX:
         raise ConfigError(f"{ctx}.zulip_topic은 {ZULIP_TOPIC_MAX}자 이하여야 합니다 (Zulip 제한): {zulip_topic}")
 
-    # topic별 쿼터 오버라이드 (선택): quota: {s2: N, arxiv: N, pending_max_age_days: N}. 없는 키는 전역 quota를 따른다.
+    # topic별 쿼터 오버라이드 (선택): quota: {s2: N, arxiv: N, pending_max_age_days: N, pending_order: ...}. 없는 키는 전역 quota를 따른다.
     quota_s2 = quota_arxiv = pending_max_age_days = None
+    pending_order = "queued"
     if t.get("quota") is not None:
         q_d = _as_dict(t["quota"], f"{ctx}.quota")
-        unknown = set(q_d) - {"s2", "arxiv", "pending_max_age_days"}
+        unknown = set(q_d) - {"s2", "arxiv", "pending_max_age_days", "pending_order"}
         if unknown:
-            raise ConfigError(f"{ctx}.quota에 알 수 없는 키: {sorted(unknown)} (허용: s2, arxiv, pending_max_age_days)")
+            raise ConfigError(f"{ctx}.quota에 알 수 없는 키: {sorted(unknown)} (허용: s2, arxiv, pending_max_age_days, pending_order)")
         if "s2" in q_d and q_d["s2"] is not None:
             quota_s2 = int(q_d["s2"])
         if "arxiv" in q_d and q_d["arxiv"] is not None:
@@ -269,10 +271,14 @@ def _parse_topic(i: int, raw: Any) -> Topic:
         if age is not None and (isinstance(age, bool) or not isinstance(age, int) or age < 0):
             raise ConfigError(f"{ctx}.quota.pending_max_age_days는 0(만료 없음) 이상의 정수(일)여야 합니다: {age!r}")
         pending_max_age_days = age
+        if q_d.get("pending_order") is not None:
+            pending_order = q_d["pending_order"]
+            if pending_order not in ("queued", "published"):
+                raise ConfigError(f"{ctx}.quota.pending_order는 'queued' 또는 'published'여야 합니다: {pending_order!r}")
 
     return Topic(name=name, interest=interest, s2=s2, arxiv=arxiv, channel=channel, platform=platform,
                  stream=stream, zulip_topic=zulip_topic, quota_s2=quota_s2, quota_arxiv=quota_arxiv,
-                 pending_max_age_days=pending_max_age_days)
+                 pending_max_age_days=pending_max_age_days, pending_order=pending_order)
 
 
 def load_config(path: str) -> Config:

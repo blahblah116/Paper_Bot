@@ -32,13 +32,19 @@ topics:
         enabled: true                # also pull preprints / 프리프린트도 받을지
         query: 'cat:cs.LG AND (abs:"graph transformer" OR abs:"graph mamba")'   # arXiv search syntax / arXiv 검색 문법
         # hf_orgs: ["deepseek-ai", "Qwen", "google"]   # optional: also take the papers these Hugging Face accounts link from their
-                                     # text-generation / image-text-to-text model cards (tag arxiv:<id>); with hf_orgs, query may be omitted
-                                     # 선택: 이 Hugging Face 계정들이 모델 카드에 건 논문(태그 arxiv:<id>)도 받는다. hf_orgs가 있으면 query 생략 가능
+                                     # text-generation / image-text-to-text model cards and from models with no pipeline_tag
+                                     # (tag arxiv:<id>); with hf_orgs, query may be omitted
+                                     # 선택: 이 Hugging Face 계정들이 모델 카드에 건 논문(태그 arxiv:<id>)도 받는다 — text-generation·
+                                     # image-text-to-text 모델과 종류 표시(pipeline_tag)가 없는 모델. hf_orgs가 있으면 query 생략 가능
         # hf_backfill_days: 1095     # optional: how far back (days) the hf_orgs path goes on --backfill (default 1095 = 3 years)
                                      # 선택: --backfill 때 hf_orgs 경로가 거슬러 올라갈 일수 (기본 1095 = 3년)
     # quota: {s2: 2, arxiv: 3}      # per-topic override of the global quota / 이 topic만 쿼터 덮어쓰기
                                     # pending_max_age_days: N in here overrides quota.pending_max_age_days for this topic (0 = never expire)
                                     # 여기에 pending_max_age_days: N을 넣으면 이 topic만 pending 만료 기준을 덮어씀 (0 = 만료 없음)
+                                    # pending_order: "published" takes this topic's pending queue out in the order the papers came out
+                                    # (arXiv id, oldest first); default "queued" = the order they entered the queue
+                                    # pending_order: "published"면 이 topic의 대기열을 논문이 공개된 순(arXiv id, 오래된 것부터)으로 꺼냄.
+                                    # 기본 "queued" = 대기열에 들어온 순
 
   - name: "cad-reverse-engineering"
     channel: "#papers-cad"
