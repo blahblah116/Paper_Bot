@@ -24,6 +24,7 @@ _HF_MODELS_URL = "https://huggingface.co/api/models"
 _HF_PIPELINE_TAGS = ("text-generation", "image-text-to-text")
 _HF_USER_AGENT = "paperbot/0.2 (paper summary bot)"
 _HF_ARXIV_TAG_RE = re.compile(r"^arxiv:(\d{4}\.\d{4,5})")   # 새 형식 id만 — cs/0101001 같은 옛 형식은 버린다
+_HF_MIN_LOOKBACK_DAYS = 90   # 논문이 나오고 몇 주 뒤에 모델 카드에 링크가 걸리거나 가중치가 늦게 공개되는 경우도 잡는다
 
 
 def _clean(text: str) -> str:
@@ -105,10 +106,12 @@ class ArxivSource(PaperSource):
 
     def _fetch_hf(self, topic: Topic) -> list[Paper]:
         """arXiv ids from the model tags of Hugging Face org accounts, then fetched from arXiv.
-        회사 계정 모델의 tags에서 arxiv:<id>를 모아 arXiv에서 받는다. id 앞 네 자리(YYMM)로 먼저 거르고(모델 카드는 옛 논문도 인용),
-        게시일이 기준(평소 arxiv_lookback_days, --backfill이면 365일)보다 오래되면 버린다."""
-        days = 365 if self.backfill else self.cfg.fetch.arxiv_lookback_days
-        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        회사 계정 모델의 tags에서 arxiv:<id>를 모아 arXiv에서 받는다. 새 논문인지는 id 앞 네 자리(YYMM)만 본다
+        (모델 카드는 옛 논문도 인용). 기간은 평소 max(arxiv_lookback_days, 90)일, --backfill이면 365일.
+        게시일(v1 제출일)은 보지 않는다 — 심사 보류 뒤 공개된 논문은 id의 달보다 몇 달 앞설 수 있다.
+        같은 논문이 매일 다시 나와도 DB(store.filter_unprocessed)가 이미 본 논문을 거른다."""
+        days = 365 if self.backfill else max(self.cfg.fetch.arxiv_lookback_days, _HF_MIN_LOOKBACK_DAYS)
+        min_yymm = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%y%m")
         ids: set[str] = set()
         for org in topic.arxiv.hf_orgs:
             try:
@@ -127,19 +130,13 @@ class ArxivSource(PaperSource):
             except Exception as e:  # noqa: BLE001 — 계정 단위 실패 격리
                 logger.warning("HF 모델 목록 실패 (%s): %s", org, e)
 
-        recent = sorted(i for i in ids if i[:4] >= cutoff.strftime("%y%m"))
-        papers: list[Paper] = []
-        for k in range(0, len(recent), 40):
-            for result in self.client.results(arxiv.Search(id_list=recent[k:k + 40], max_results=None)):
-                published = result.published
-                if published.tzinfo is None:
-                    published = published.replace(tzinfo=timezone.utc)
-                if published >= cutoff:
-                    papers.append(_to_paper(result, topic))
+        recent = sorted(i for i in ids if i[:4] >= min_yymm)
+        papers = [_to_paper(result, topic) for k in range(0, len(recent), 40)
+                  for result in self.client.results(arxiv.Search(id_list=recent[k:k + 40], max_results=None))]
 
         logger.info(
-            "arXiv '%s' (HF 계정 %d곳): 태그 id %d개 → YYMM 통과 %d개 → 최근 %d편 (%d일%s)",
-            topic.name, len(topic.arxiv.hf_orgs), len(ids), len(recent), len(papers), days,
+            "arXiv '%s' (HF 계정 %d곳): 태그 id %d개 → %s 이후 %d개 → %d편 (%d일%s)",
+            topic.name, len(topic.arxiv.hf_orgs), len(ids), min_yymm, len(recent), len(papers), days,
             ", backfill" if self.backfill else "",
         )
         return papers
