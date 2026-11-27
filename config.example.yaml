@@ -34,6 +34,8 @@ topics:
         # hf_orgs: ["deepseek-ai", "Qwen", "google"]   # optional: also take the papers these Hugging Face accounts link from their
                                      # text-generation / image-text-to-text model cards (tag arxiv:<id>); with hf_orgs, query may be omitted
                                      # 선택: 이 Hugging Face 계정들이 모델 카드에 건 논문(태그 arxiv:<id>)도 받는다. hf_orgs가 있으면 query 생략 가능
+        # hf_backfill_days: 1095     # optional: how far back (days) the hf_orgs path goes on --backfill (default 1095 = 3 years)
+                                     # 선택: --backfill 때 hf_orgs 경로가 거슬러 올라갈 일수 (기본 1095 = 3년)
     # quota: {s2: 2, arxiv: 3}      # per-topic override of the global quota / 이 topic만 쿼터 덮어쓰기
 
   - name: "cad-reverse-engineering"

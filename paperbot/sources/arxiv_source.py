@@ -107,10 +107,13 @@ class ArxivSource(PaperSource):
     def _fetch_hf(self, topic: Topic) -> list[Paper]:
         """arXiv ids from the model tags of Hugging Face org accounts, then fetched from arXiv.
         회사 계정 모델의 tags에서 arxiv:<id>를 모아 arXiv에서 받는다. 새 논문인지는 id 앞 네 자리(YYMM)만 본다
-        (모델 카드는 옛 논문도 인용). 기간은 평소 max(arxiv_lookback_days, 90)일, --backfill이면 365일.
+        (모델 카드는 옛 논문도 인용). 기간은 평소 max(arxiv_lookback_days, 90)일, --backfill이면 topic의 hf_backfill_days(기본 1095일).
         게시일(v1 제출일)은 보지 않는다 — 심사 보류 뒤 공개된 논문은 id의 달보다 몇 달 앞설 수 있다.
         같은 논문이 매일 다시 나와도 DB(store.filter_unprocessed)가 이미 본 논문을 거른다."""
-        days = 365 if self.backfill else max(self.cfg.fetch.arxiv_lookback_days, _HF_MIN_LOOKBACK_DAYS)
+        if self.backfill:
+            days = topic.arxiv.hf_backfill_days
+        else:
+            days = max(self.cfg.fetch.arxiv_lookback_days, _HF_MIN_LOOKBACK_DAYS)
         min_yymm = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%y%m")
         ids: set[str] = set()
         for org in topic.arxiv.hf_orgs:
