@@ -17,14 +17,14 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-def lock_held(path: str) -> bool:
-    """lockfile이 있고 그 pid가 살아 있으면 True."""
+def lock_held(path: str, *, ignore_self: bool = False) -> bool:
+    """lockfile이 있고 그 pid가 살아 있으면 True. ignore_self면 이 프로세스 자신의 pid는 제외(두 봇의 lockfile이 같은 파일일 때)."""
     try:
         with open(path) as f:
             pid = int(f.read().strip() or "0")
     except (OSError, ValueError):
         return False
-    return pid > 0 and _pid_alive(pid)
+    return pid > 0 and not (ignore_self and pid == os.getpid()) and _pid_alive(pid)
 
 
 def acquire_lock(path: str) -> bool:

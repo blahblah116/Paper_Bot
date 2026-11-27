@@ -350,7 +350,7 @@ def run(cfg: Config, args) -> int:
         _log_backlog(store)
 
     if used_llm and cfg.llm.unload_after_run:
-        busy = [p for p in cfg.llm.peer_lockfiles if lock_held(p)]
+        busy = [p for p in cfg.llm.peer_lockfiles if lock_held(p, ignore_self=True)]
         if busy:
             logger.info("다른 봇이 같은 모델을 사용 중(%s) — 언로드 생략", ", ".join(busy))
         else:
