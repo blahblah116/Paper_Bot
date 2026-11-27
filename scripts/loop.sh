@@ -14,15 +14,16 @@ cd "$(dirname "$0")/.." || exit 1   # 리포 루트로 이동
 LLM_URL="http://127.0.0.1:8090"
 LLAMA_SWAP_CMD='$HOME/llama-swap/llama-swap -config $HOME/llama-swap/config.yaml -listen 127.0.0.1:8090 -watch-config 2>&1 | tee -a $HOME/llama-swap/llama-swap.log'
 
-# 공용 서버 VRAM 체크 — 27b(64K ctx)가 GPU 1,2에 ~11GB씩 올라가므로, 장당 13GB 미만이면
-# 타 사용자 잡을 OOM으로 죽일 수 있다. 부족하면 30분 간격으로 최대 2시간 기다리고, 그래도 안 되면 그날은 건너뜀.
+# 공용 서버 VRAM 체크 — 27b(128K ctx)는 GPU 1,2에 장마다 다르게 올라간다 (2026-11-27 실측, GPU 1/2: 로드 직후 12,857/14,801MiB,
+# 118,823 token 입력 처리 중 최대 13,231/15,365MiB, 빈 GPU 여유 16,147MiB). 여유가 이보다 적으면 모델이 못 올라가 그날 LLM 호출이
+# 전부 실패하거나 타 사용자 잡을 OOM으로 죽일 수 있다. 부족하면 30분 간격으로 최대 2시간 기다리고, 그래도 안 되면 그날은 건너뜀.
 VRAM_GPUS="1,2"
-VRAM_MIN_MIB=13312          # 장당 최소 여유 (13GB)
+VRAM_MIN_MIB="13600,15700"  # GPU별 최소 여유 (VRAM_GPUS와 같은 순서, 위 최대치에 여유를 둔 값)
 VRAM_WAIT_SEC=1800          # 재확인 간격 (30분)
 VRAM_MAX_WAIT_SEC=7200      # 최대 대기 (2시간)
 
 vram_ok() {
-    local free loaded
+    local free loaded gpus mins f i=0 short=0
     # zoterobot DM 챗봇이 같은 모델을 이미 올려 둔 상태면 그대로 재사용하면 되므로 통과
     # (그 모델이 VRAM을 차지해 여유가 기준 미만으로 보이는 것을 '부족'으로 오판하지 않게). 판정은 봇과 같은 헬퍼(llmserver)로.
     loaded=$(./venv/bin/python -c "
@@ -38,11 +39,17 @@ print(c.llm.model if llmserver.is_loaded(llmserver.origin(c.llm.base_url), c.llm
         echo "[loop] nvidia-smi 실패 — VRAM 체크 생략하고 실행"
         return 0
     }
-    echo "[loop] GPU ${VRAM_GPUS} 여유 VRAM(MiB): $(echo $free | tr ' ' '/') (기준 ${VRAM_MIN_MIB})"
+    echo "[loop] GPU ${VRAM_GPUS} 여유 VRAM(MiB): $(echo $free | tr ' ' '/') (기준 $(echo $VRAM_MIN_MIB | tr ',' '/'))"
+    IFS=, read -ra gpus <<< "$VRAM_GPUS"
+    IFS=, read -ra mins <<< "$VRAM_MIN_MIB"
     for f in $free; do
-        [ "$f" -ge "$VRAM_MIN_MIB" ] || return 1
+        if [ "$f" -lt "${mins[i]}" ]; then
+            echo "[loop] GPU ${gpus[i]} 여유 ${f}MiB < 기준 ${mins[i]}MiB ($(( mins[i] - f ))MiB 부족)"
+            short=1
+        fi
+        i=$(( i + 1 ))
     done
-    return 0
+    return $short
 }
 
 echo "[loop] paperbot 러너 시작 — 매일 ${AT} 실행"
