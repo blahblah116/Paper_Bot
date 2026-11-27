@@ -85,8 +85,8 @@ filter:
 llm:
   base_url: "http://localhost:8090/v1"    # llama-swap in front of llama-server, OpenAI-compatible / llama-swap(llama-server) OpenAI 호환 엔드포인트
   model: "qwen3.8:27b"        # fits two 16GB GPUs; use a ~9b model on one GPU / 16GB GPU 2장 기준, 1장이면 9b급
-  num_ctx: 65536              # must match llama-server -c in the llama-swap config / llama-swap 설정의 llama-server -c와 일치
-  max_input_chars: 150000     # paper text sent to the model (fits in num_ctx) / 본문 입력 상한
+  num_ctx: 65536              # must match llama-server -c; the paper is fitted in tokens to the server's real context − max_output_tokens (this value if unreadable) / llama-server -c와 일치 — 요약 입력은 서버의 실제 컨텍스트 − max_output_tokens에 token으로 맞춤 (못 읽으면 이 값)
+  max_input_chars: 150000     # fallback cut in chars, only when tokens can't be counted (model not loaded yet) / token을 셀 수 없을 때(모델이 아직 안 올라옴)만 쓰는 글자 수 상한
   max_output_tokens: 8192     # summary length cap / 요약 출력 상한
   temperature: 0.3
   language: "ko"              # summary language / 요약 언어
