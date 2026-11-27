@@ -135,7 +135,7 @@ def _select(cfg: Config, store: Store, passed: list[Paper], limit: int | None,
         logger.info("pending 만료 폐기: %d편 (%s)", expired, ", ".join(
             f"{t} {d}일 초과" if d else f"{t} 만료 없음"
             for t, d in [("기본", cfg.quota.pending_max_age_days), *sorted(pending_max_age.items())]))
-    pending = store.load_all_pending(list(topics_by_name))
+    pending = store.load_all_pending(list(topics_by_name), {n: t.pending_order for n, t in topics_by_name.items()})
     if pending:
         logger.info("pending 대기열 %d편 로드 (오래된 순 우선)", len(pending))
 

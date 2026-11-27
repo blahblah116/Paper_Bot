@@ -25,6 +25,7 @@ _HF_PIPELINE_TAGS = ("text-generation", "image-text-to-text")
 _HF_USER_AGENT = "paperbot/0.2 (paper summary bot)"
 _HF_ARXIV_TAG_RE = re.compile(r"^arxiv:(\d{4}\.\d{4,5})")   # 새 형식 id만 — cs/0101001 같은 옛 형식은 버린다
 _HF_MIN_LOOKBACK_DAYS = 90   # 논문이 나오고 몇 주 뒤에 모델 카드에 링크가 걸리거나 가중치가 늦게 공개되는 경우도 잡는다
+_HF_UNTAGGED_MAX_PAGES = 5   # --backfill 때 종류 표시 없는 모델 목록을 넘길 최대 쪽 수 (google·nvidia·facebook은 모델이 1000개 넘음)
 
 
 def _clean(text: str) -> str:
@@ -106,7 +107,8 @@ class ArxivSource(PaperSource):
 
     def _fetch_hf(self, topic: Topic) -> list[Paper]:
         """arXiv ids from the model tags of Hugging Face org accounts, then fetched from arXiv.
-        회사 계정 모델의 tags에서 arxiv:<id>를 모아 arXiv에서 받는다. 새 논문인지는 id 앞 네 자리(YYMM)만 본다
+        회사 계정 모델의 tags에서 arxiv:<id>를 모아 arXiv에서 받는다. 모델은 text-generation·image-text-to-text와
+        종류 표시(pipeline_tag)가 없는 것 — 다른 종류(음성·이미지 등)로 표시된 모델은 보지 않는다. 새 논문인지는 id 앞 네 자리(YYMM)만 본다
         (모델 카드는 옛 논문도 인용). 기간은 평소 max(arxiv_lookback_days, 90)일, --backfill이면 topic의 hf_backfill_days(기본 1095일).
         게시일(v1 제출일)은 보지 않는다 — 심사 보류 뒤 공개된 논문은 id의 달보다 몇 달 앞설 수 있다.
         같은 논문이 매일 다시 나와도 DB(store.filter_unprocessed)가 이미 본 논문을 거른다."""
@@ -116,6 +118,7 @@ class ArxivSource(PaperSource):
             days = max(self.cfg.fetch.arxiv_lookback_days, _HF_MIN_LOOKBACK_DAYS)
         min_yymm = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%y%m")
         ids: set[str] = set()
+        untagged: set[str] = set()   # 종류 표시 없는 모델에서 온 id
         for org in topic.arxiv.hf_orgs:
             try:
                 for pipeline_tag in _HF_PIPELINE_TAGS:
@@ -130,16 +133,35 @@ class ArxivSource(PaperSource):
                     r.raise_for_status()
                     ids.update(m.group(1) for model in r.json() for tag in model.get("tags") or []
                                if (m := _HF_ARXIV_TAG_RE.match(tag)))
+                # pipeline_tag 없이 한 번 더 — 회사 계정에는 종류 표시가 없는 모델이 많다(mistralai 83개 중 67개).
+                # 이 응답에서는 표시가 없는(None) 모델만 쓴다. --backfill이면 Link 헤더(rel="next")로 다음 쪽도 받는다.
+                url, pages = _HF_MODELS_URL, 0
+                params = {"author": org, "sort": "lastModified", "direction": -1, "limit": 1000 if self.backfill else 100}
+                while url and pages < (_HF_UNTAGGED_MAX_PAGES if self.backfill else 1):
+                    time.sleep(0.5)
+                    r = requests.get(url, params=params, headers={"User-Agent": _HF_USER_AGENT}, timeout=30)
+                    r.raise_for_status()
+                    pages += 1
+                    untagged.update(m.group(1) for model in r.json() if model.get("pipeline_tag") is None
+                                    for tag in model.get("tags") or [] if (m := _HF_ARXIV_TAG_RE.match(tag)))
+                    url, params = r.links.get("next", {}).get("url"), None   # 다음 쪽 URL에 조회 조건과 cursor가 다 들어 있다
+                if self.backfill and url:
+                    logger.warning("HF 종류 표시 없는 모델 (%s): %d쪽에서 멈춤 — 다음 쪽이 남았다", org, pages)
+                elif self.backfill:
+                    logger.info("HF 종류 표시 없는 모델 (%s): %d쪽", org, pages)
             except Exception as e:  # noqa: BLE001 — 계정 단위 실패 격리
                 logger.warning("HF 모델 목록 실패 (%s): %s", org, e)
 
+        untagged_only = untagged - ids
+        ids |= untagged
         recent = sorted(i for i in ids if i[:4] >= min_yymm)
         papers = [_to_paper(result, topic) for k in range(0, len(recent), 40)
                   for result in self.client.results(arxiv.Search(id_list=recent[k:k + 40], max_results=None))]
 
         logger.info(
-            "arXiv '%s' (HF 계정 %d곳): 태그 id %d개 → %s 이후 %d개 → %d편 (%d일%s)",
-            topic.name, len(topic.arxiv.hf_orgs), len(ids), min_yymm, len(recent), len(papers), days,
+            "arXiv '%s' (HF 계정 %d곳): 태그 id %d개 → %s 이후 %d개 (종류 표시 없는 모델에서만 %d개) → %d편 (%d일%s)",
+            topic.name, len(topic.arxiv.hf_orgs), len(ids), min_yymm, len(recent),
+            sum(i[:4] >= min_yymm for i in untagged_only), len(papers), days,
             ", backfill" if self.backfill else "",
         )
         return papers
