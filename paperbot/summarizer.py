@@ -7,6 +7,8 @@ num_ctx — 중요:
 컨텍스트 길이는 요청이 아니라 서버 실행 옵션(~/llama-swap/config.yaml의 llama-server -c)으로 정해진다.
 첫 호출 성공 직후 llama-server /props로 실제 컨텍스트를 확인해
 config보다 작으면 경고를 남긴다 (논문이 조용히 잘리는 것 방지).
+요약 입력은 호출 전에 llama-server /tokenize로 token 수를 세어 실제 컨텍스트 − max_output_tokens에 맞춘다
+(_fit_input — 셀 수 없으면 max_input_chars 글자 수 절단).
 
 judge(filter.py)와 요약이 이 모듈의 make_client/chat을 공유한다.
 """
@@ -20,13 +22,14 @@ from openai import OpenAI
 
 from . import llmserver
 from .config import Config
-from .extractor import ExtractResult
+from .extractor import ExtractResult, truncate_tokens
 from .models import Paper
 from .prompts import build_summary_system_prompt, build_summary_user_prompt
 
 logger = logging.getLogger(__name__)
 
 _MAX_RETRIES = 3
+_TEMPLATE_SLACK_TOKENS = 256   # 요약 입력 예산에서 더 떼는 몫 — chat template의 역할 표시·특수 토큰(system·user를 이어 셀 때 빠짐)
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 # 출력이 max_tokens에 잘려 </think> 없이 끝난 경우 — 미완 thinking 전체를 제거.
 _THINK_OPEN_RE = re.compile(r"<think>.*\Z", re.DOTALL | re.IGNORECASE)
@@ -132,13 +135,45 @@ def unload_model(cfg: Config) -> bool:
     return llmserver.unload(llmserver.origin(cfg.llm.base_url), cfg.llm.model)
 
 
+def _fit_input(cfg: Config, paper: Paper, extracted: ExtractResult, system: str) -> str:
+    """요약 입력 본문 — full_text(없으면 text)를 서버 컨텍스트에 token 기준으로 맞춘다.
+
+    예산 = 서버의 실제 컨텍스트(/props, 모르면 num_ctx) − max_output_tokens − chat template 여유.
+    system + user 프롬프트 전체의 token 수가 예산 안이면 그대로, 넘으면 넘는 만큼만 중간을 자른다(truncate_tokens).
+    모델이 아직 안 올라와 있는 등 token을 셀 수 없으면 max_input_chars로 자른 extracted.text를 쓴다.
+    """
+    origin = llmserver.origin(cfg.llm.base_url)
+    ctx = llmserver.server_ctx(origin, cfg.llm.model) or cfg.llm.num_ctx
+    budget = ctx - cfg.llm.max_output_tokens - _TEMPLATE_SLACK_TOKENS
+    full = extracted.full_text or extracted.text
+
+    def count(body: str) -> int | None:
+        user = build_summary_user_prompt(paper, body, extracted.abstract_only)
+        return llmserver.count_tokens(origin, cfg.llm.model, f"{system}\n{user}")
+
+    fit = truncate_tokens(full, budget, count)
+    if fit is None:
+        logger.info("요약 입력 %s: token 수로 맞추지 못함(모델이 안 올라와 있음 등) — 글자 수로 자른 %d자 (전체 %d자, max_input_chars %d)",
+                    paper.uid, len(extracted.text), len(full), cfg.llm.max_input_chars)
+        return extracted.text
+    body, total, kept = fit
+    if total <= budget:
+        logger.info("요약 입력 %s: %d token (예산 %d) — 자르지 않음, %d자", paper.uid, total, budget, len(body))
+    else:
+        logger.info("요약 입력 %s: 전체 %d token 중 %d token 남김 (예산 %d) — %d자 중 %d자",
+                    paper.uid, total, kept, budget, len(full), len(body))
+    return body
+
+
 def summarize(cfg: Config, paper: Paper, extracted: ExtractResult, client: OpenAI | None = None) -> str:
     """논문 하나를 요약해 마크다운 문자열을 반환. 실패 시 LLMError."""
     client = client or make_client(cfg)
     math = "latex" if cfg.platform_for(paper.topic_name) == "zulip" else "plain"   # Zulip만 $$LaTeX$$ 렌더링
+    system = build_summary_system_prompt(cfg.llm.language, math)
+    body = _fit_input(cfg, paper, extracted, system)
     messages = [
-        {"role": "system", "content": build_summary_system_prompt(cfg.llm.language, math)},
-        {"role": "user", "content": build_summary_user_prompt(paper, extracted.text, extracted.abstract_only)},
+        {"role": "system", "content": system},
+        {"role": "user", "content": build_summary_user_prompt(paper, body, extracted.abstract_only)},
     ]
     content = chat(client, cfg, messages, label=f"요약({paper.uid})")
     logger.info("요약 완료 %s: %d자", paper.uid, len(content))

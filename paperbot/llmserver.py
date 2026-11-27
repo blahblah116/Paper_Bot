@@ -1,5 +1,5 @@
-"""llama-swap helpers: running-model lookup, server context check, and a safe unload.
-llama-swap(로컬 LLM 프록시) 관리 헬퍼 — 실행 중 모델 조회·실제 컨텍스트 확인·안전한 언로드.
+"""llama-swap helpers: running-model lookup, server context check, token count, and a safe unload.
+llama-swap(로컬 LLM 프록시) 관리 헬퍼 — 실행 중 모델 조회·실제 컨텍스트 확인·token 수 세기·안전한 언로드.
 
 봇들(paperbot·articlebot·zoterobot)은 llama-swap(기본 http://127.0.0.1:8090)의 OpenAI 호환 /v1로 모델을 부른다.
 llama-swap은 요청이 오면 llama-server(llama.cpp CUDA 빌드)를 띄우고 마지막 요청 후 ttl이 지나면 내린다
@@ -68,6 +68,20 @@ def server_ctx(origin_url: str, model: str) -> int | None:
         return n or None
     except Exception as e:  # noqa: BLE001
         logger.debug("llama-server /props 조회 실패: %s", e)
+        return None
+
+
+def count_tokens(origin_url: str, model: str, text: str) -> int | None:
+    """떠 있는 llama-server의 /tokenize로 text의 token 수. 모델이 내려가 있거나 실패하면 None."""
+    up = upstream_url(origin_url, model)
+    if not up:
+        return None
+    try:
+        r = requests.post(f"{up}/tokenize", json={"content": text}, timeout=60)
+        r.raise_for_status()
+        return len(r.json()["tokens"])
+    except Exception as e:  # noqa: BLE001
+        logger.debug("llama-server /tokenize 실패: %s", e)
         return None
 
 
