@@ -125,12 +125,16 @@ def process_paper(cfg, store, publisher, paper, client) -> bool:
 
 
 def _select(cfg: Config, store: Store, passed: list[Paper], limit: int | None,
-            topics_by_name: dict, replay_items: list = ()) -> list[Paper]:   # [REPLAY] replay_items 인자만 지운다
+            topics_by_name: dict, pending_max_age: dict, replay_items: list = ()) -> list[Paper]:   # [REPLAY] replay_items 인자만 지운다
     """pending 대기열 + 신규 통과분에 쿼터를 적용해 이번 실행 처리분을 고르고, 밀린 신규분은 pending으로.
+    pending_max_age: topic별 pending 만료 일수 오버라이드({topic: 일수}, 0 = 만료 없음) — 만료는 DB의 모든 topic에 돌므로
+    --topic으로 줄이기 전 전체 topic에서 모은 것.
     replay_items([REPLAY], Zulip 되올리기)가 있으면 그 topic의 신규는 빼고 --limit도 그만큼 줄여 센다."""
-    expired = store.expire_pending(cfg.quota.pending_max_age_days)
+    expired = store.expire_pending(cfg.quota.pending_max_age_days, pending_max_age)
     if expired:
-        logger.info("pending 만료 폐기: %d편 (%d일 초과)", expired, cfg.quota.pending_max_age_days)
+        logger.info("pending 만료 폐기: %d편 (%s)", expired, ", ".join(
+            f"{t} {d}일 초과" if d else f"{t} 만료 없음"
+            for t, d in [("기본", cfg.quota.pending_max_age_days), *sorted(pending_max_age.items())]))
     pending = store.load_all_pending(list(topics_by_name))
     if pending:
         logger.info("pending 대기열 %d편 로드 (오래된 순 우선)", len(pending))
@@ -157,6 +161,8 @@ def _select(cfg: Config, store: Store, passed: list[Paper], limit: int | None,
 
 def run(cfg: Config, opts: RunOptions) -> int:
     """파이프라인 1회 실행. 종료 코드: 0 정상, 1 전송 설정 오류로 중단, 2 옵션 오류."""
+    # topic별 pending 만료 일수 — --topic으로 cfg.topics를 줄이기 전에 모은다 (만료는 DB의 모든 topic pending에 돈다).
+    pending_max_age = {t.name: t.pending_max_age_days for t in cfg.topics if t.pending_max_age_days is not None}
     if opts.topic:
         topics = [t for t in cfg.topics if t.name == opts.topic]
         if not topics:
@@ -188,7 +194,7 @@ def run(cfg: Config, opts: RunOptions) -> int:
         logger.info("필터 통과 %d편 (미처리 %d편 중)", n_passed, len(todo))
 
         replay_items = _replay.select(cfg, store, publisher)[: opts.limit]   # [REPLAY] Zulip 되올리기 — 옛 논문 먼저
-        selected = _select(cfg, store, passed, opts.limit, topics_by_name, replay_items)   # [REPLAY] 마지막 인자만 지운다
+        selected = _select(cfg, store, passed, opts.limit, topics_by_name, pending_max_age, replay_items)   # [REPLAY] 마지막 인자만 지운다
 
         done = failed = 0
         config_error: PublishConfigError | None = None

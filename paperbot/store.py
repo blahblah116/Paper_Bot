@@ -179,18 +179,24 @@ class Store:
         ).fetchall()
         return {(r["topic"], r["source"]): r["n"] for r in rows}
 
-    def expire_pending(self, max_age_days: int) -> int:
-        """max_age_days보다 오래 대기한 pending을 'expired'로 폐기. 0이면 비활성. 반환: 폐기 수."""
-        if max_age_days <= 0:
-            return 0
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=max_age_days)).isoformat()
-        cur = self.conn.execute(
-            "UPDATE papers SET status='expired', error=?, payload=NULL "
-            "WHERE status='pending' AND processed_at < ?",
-            (f"pending {max_age_days}일 초과", cutoff),
-        )
+    def expire_pending(self, max_age_days: int, topic_max_age: dict[str, int] | None = None) -> int:
+        """max_age_days보다 오래 대기한 pending을 'expired'로 폐기. 0이면 비활성. 반환: 폐기 수.
+        topic_max_age({topic: 일수})에 있는 topic은 그 값을 따른다 (0이면 그 topic은 만료 없음)."""
+        topic_max_age = topic_max_age or {}
+        now = datetime.now(timezone.utc)
+        expired = 0
+        for r in self.conn.execute("SELECT DISTINCT topic FROM papers WHERE status='pending'").fetchall():
+            days = topic_max_age.get(r["topic"], max_age_days)
+            if days <= 0:
+                continue
+            cur = self.conn.execute(
+                "UPDATE papers SET status='expired', error=?, payload=NULL "
+                "WHERE status='pending' AND topic=? AND processed_at < ?",
+                (f"pending {days}일 초과", r["topic"], (now - timedelta(days=days)).isoformat()),
+            )
+            expired += cur.rowcount
         self.conn.commit()
-        return cur.rowcount
+        return expired
 
     # --- S2 페이지 커서 (인용순 topic의 bulk 검색 continuation token) ---
     def get_s2_cursor(self, topic: str) -> dict | None:
