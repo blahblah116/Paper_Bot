@@ -257,7 +257,7 @@ python -m paperbot --backfill-chat [--limit N] [--topic NAME]   # fill the chat 
 
 ### 4.3 Scheduling
 
-`scripts/loop.sh HH:MM` sleeps until the given time, checks that both GPUs have at least 13 GB free (waits up to 2 hours, then skips the day), restarts llama-swap if it is not responding, runs paperbot, and then articlebot (`scripts/articlebot.sh`, 3-hour limit, only when `articlebot/config.yaml` exists). A day skipped for lack of VRAM skips both. If the summary model is already loaded (zoterobot answered a DM a moment ago) the VRAM check is skipped and the loaded model is reused.
+`scripts/loop.sh HH:MM` sleeps until the given time, checks each GPU's free VRAM against its own minimum, `VRAM_MIN_MIB` in the same order as `VRAM_GPUS` (GPU 1: 13,600 MiB, GPU 2: 15,700 MiB; the 27b model at 128K context peaked at 13,231 and 15,365 MiB, measured 2026-11-27) and logs which GPU is short by how much (waits up to 2 hours, then skips the day), restarts llama-swap if it is not responding, runs paperbot, and then articlebot (`scripts/articlebot.sh`, 3-hour limit, only when `articlebot/config.yaml` exists). A day skipped for lack of VRAM skips both. If the summary model is already loaded (zoterobot answered a DM a moment ago) the VRAM check is skipped and the loaded model is reused.
 
 ```bash
 tmux new -d -s paperbot '~/paperbot/scripts/loop.sh 07:00'
